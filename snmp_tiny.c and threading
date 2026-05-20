@@ -1,0 +1,43 @@
+ 6. snmp_tiny.c — DATA GENERATOR
+🎯 Purpose
+👉 Fills the MIB with values
+
+🔥 What it does
+✅ At start:
+Add:
+- system name
+- location
+- description
+
+
+✅ Every 2 seconds:
+update heartbeat
+
+Example:
+1 → 2 → 3 → 4 → ...
+
+
+🧠 Real Understanding
+👉 This file = data creator
+Without it:
+❌ SNMP returns nothing
+
+
+7. THREADING (VERY IMPORTANT IN YOUR PROJECT)
+You have:
+Thread 1:
+
+heartbeat updating
+
+Thread 2:
+
+network listening
+
+
+🧠 Why needed?
+Without threads:
+❌ program can’t do 2 things at same time
+
+✅ With threads:
+✔ update data
+✔ listen to network
