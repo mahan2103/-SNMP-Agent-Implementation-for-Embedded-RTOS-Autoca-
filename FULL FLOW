@@ -1,0 +1,31 @@
+FULL FLOW (FINAL CLARITY)
+1. PC sends OID request
+2. UDP receives packet
+3. BER decoder extracts OID
+4. MIB searches value
+5. Value given to encoder
+6. BER builds response packet
+7. UDP sends reply
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
