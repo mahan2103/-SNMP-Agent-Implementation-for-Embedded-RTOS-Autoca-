@@ -1,0 +1,201 @@
+Introduction
+During my six-month internship at BEUMER Group, within the Airport Engineering department, I worked on the design and development of a lightweight SNMP (Simple Network Management Protocol) agent for the Autoca embedded controller system.
+The Autoca system is part of industrial airport logistics, where multiple automated carts operate within a network. Monitoring the state of these devices in real-time is critical for maintaining performance, debugging issues, and ensuring system reliability.
+The goal of my project was to enable remote monitoring capability by implementing a simplified SNMPv1 agent, allowing external monitoring tools (such as PRTG) to query real-time device information over a network.
+
+Project Objective
+The primary objective of the project was to:
+
+Develop a lightweight SNMP agent suitable for embedded systems
+Enable UDP-based communication on port 161
+Provide real-time system information such as device identity and heartbeat
+Integrate SNMP into an existing embedded RTOS environment
+Ensure low memory and CPU usage
+
+Unlike full-scale SNMP servers, the focus was on a minimal and optimized solution specifically designed for resource-constrained systems.
+
+Understanding the System
+Before implementation, I first built a strong understanding of:
+
+SNMP architecture (Manager–Agent model)
+MIB (Management Information Base)
+OIDs (Object Identifiers)
+UDP communication principles
+BER (Basic Encoding Rules) for packet encoding
+
+This foundation was essential to design a system that correctly communicates with external SNMP managers.
+
+System Architecture
+The system I worked on was modular and consisted of the following key components:
+1. SNMP Agent
+The SNMP agent runs inside the Autoca device and is responsible for:
+
+Receiving SNMP requests
+Processing OIDs
+Responding with corresponding values
+
+2. SNMP Manager
+An external system (e.g., PRTG) sends SNMP GET requests to retrieve system data.
+3. MIB (Data Storage)
+A simple database that stores:
+OID → Value
+
+Example:
+1.3.6.1.2.1.1.5.0 → "autoca 103"
+
+
+Implementation Details
+1. MIB Implementation (snmp_mib.c)
+One of the core parts of my work was building a simple in-memory MIB database.
+
+Implemented using a fixed-size array (32 entries)
+Each entry stores:
+
+OID (string)
+Value (string)
+
+
+
+Key Features:
+
+Initialization of MIB structure
+Adding and updating OID entries
+Searching and retrieving values
+Handling cases where OIDs do not exist
+
+To ensure safety, I implemented a control flag (g_bReady) to prevent access before initialization or after shutdown.
+
+2. UDP Communication (snmp_udp.c)
+I implemented the network layer responsible for SNMP communication.
+
+Listens on UDP port 161
+Receives incoming SNMP packets
+Sends responses back to the manager
+
+Key Learning:
+
+UDP is connectionless and lightweight, which makes it ideal for embedded SNMP communication.
+Unlike TCP, no connection setup is required, reducing overhead.
+
+
+3. SNMP Packet Processing (snmp_v1.c)
+This module handles conversion between raw network packets and readable data.
+Responsibilities:
+
+Extract OIDs from incoming SNMP requests
+Build SNMP response messages
+Handle error responses for invalid OIDs
+
+This was one of the most technically challenging parts of the project.
+
+4. BER Encoding / Decoding
+SNMP packets are not sent as readable text; instead, they use BER (Basic Encoding Rules).
+I worked on understanding and using BER to:
+
+Decode incoming requests into readable OIDs
+Encode response values back into byte format
+
+Concept:
+BER follows:
+[Tag][Length][Value]
+
+Example:
+
+Tag → Type of data
+Length → Size
+Value → Actual information
+
+Learning BER significantly improved my understanding of low-level networking protocols.
+
+5. Data Generation (snmp_tiny.c)
+I implemented logic to populate the MIB with relevant system information.
+Startup Initialization:
+
+System description
+Device name
+Device location
+
+Runtime Updates:
+
+Heartbeat value updated every 2 seconds
+
+This allows monitoring systems to track whether the device is active.
+
+6. Multithreading Design
+To ensure real-time performance, I worked with a multi-threaded architecture:
+
+Thread 1: Periodic heartbeat updates
+Thread 2: Continuous network listening
+
+This design allows the system to:
+
+Respond to requests instantly
+Update system values simultaneously
+
+
+Testing and Validation
+The system was tested using:
+
+Paessler SNMP Tester
+PRTG Network Monitor
+
+Test Cases Covered:
+
+Valid OID request → Correct value returned ✅
+Invalid OID request → Error response ✅
+Continuous polling → Stable performance ✅
+Heartbeat update → Incrementing correctly ✅
+
+Through testing, I ensured the system behaves correctly in real-world conditions.
+
+Real-World Impact
+This implementation enables:
+
+Centralized monitoring of Autoca devices
+Real-time diagnostics
+Improved system visibility
+
+It can be extended to:
+
+Conveyor systems
+Industrial IoT devices
+Automated logistics systems
+
+
+Skills & Learning Outcomes
+During the internship, I gained practical experience in:
+Technical Skills:
+
+Embedded C programming
+UDP networking
+SNMP protocol implementation
+BER encoding and decoding
+Multithreading in RTOS environments
+System-level debugging
+
+Conceptual Skills:
+
+System architecture design
+Protocol-level thinking
+Data structuring (MIB design)
+Real-time system behavior
+
+
+Challenges Faced
+Some of the major challenges I encountered:
+
+Understanding SNMP packet structure
+Working with BER encoding
+Debugging network communication issues
+Integrating with existing system architecture
+
+Overcoming these challenges helped me significantly improve my problem-solving skills.
+
+Conclusion
+This internship provided me with hands-on experience in:
+
+Building a real-world network protocol system
+Working with embedded industrial applications
+Designing a modular, scalable architecture
+
+The project successfully delivered a functional SNMP agent, enabling remote monitoring of embedded devices, and strengthened my understanding of both low-level systems and network communication.
