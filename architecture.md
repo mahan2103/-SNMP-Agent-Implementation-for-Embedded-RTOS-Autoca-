@@ -52,4 +52,4 @@ The SNMP agent is designed with a modular structure:
 ┌─────────────────────────┐
 │     SNMP Manager        │
 │ Receives Response Value │
-└─────────────────────────┘
+└─────────────────────────┘    
