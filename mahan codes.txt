@@ -1,0 +1,3480 @@
+/******************************************************************************
+*M MyApp.cpp
+*M
+*M Haupt-Klasse der Applikation
+*M
+*B 06.11.2002 WR
+*H 31.08.2015 ROM, _MyApp() geändert
+*H 30.03.2020 ROM  Changes to MyApp_CreateDefaultPara() to be able to work with autoca
+*H                 IDs greater than 255
+*H 02.05.2023 ROM, Changes to MyApp() to save the NVD just before system ready.
+*H 28.09.2023 ROM, Changes to eliminate the segment behaviour
+*H 14.11.2023 ROM, Changes to MyApp() to inform the user in case of NVD problems
+*******************************************************************************/
+
+// API
+#include <ApiOS.h>
+#include <ApiSem.h>
+#include <ApiSock.h>
+#include <ApiThrd.h>
+#include <ApiWLan.h>
+#include <ApiRema.h>
+#include <apiarp.h>
+
+// Common
+#include <SEW.h>
+#include <GloStore.h>
+#include <para.h>
+#include <AutoErr.h>
+#include <ModIac.h>
+#include <can.h>
+#include <fu1.h>
+#include <fu3.h>
+#include <Udp.h>
+#include <a_b_job.h>
+#include <a_i_job.h>
+#include <JobList.h>
+#include <ModWork.h>
+#include <ModDrive.h>
+#include <ModTasks.h>
+#include <MpWork.h>
+#include <ConBeAS.h>
+#include <conremo.h>
+#include <ConAuto.h>
+#include <ConIac.h>
+#include <autolog.h>
+#include <Utb.h>
+#include <utils.h>
+#include <TH_Tools.h>
+#include <disppipe.h>
+#include <routetyp.h>
+#include <profutil.h>
+#include <ea.h>
+#include <DrSys.h>
+#include <wlan.h>
+#include <pic.h>
+#include <exmod.h>
+#include <exmod_ea.h>
+#include <apican.h>
+#include <simcan.h>
+#include <simea.h>
+#include <simfu1.h>
+#include <simfu3.h>
+#include <simpic.h>
+#include <simexmod_ea.h>
+#include <myapp.h>
+#include <main.h>
+#include <accsense.h>
+#include "..\common\arp.h"
+#include <xmlp.h>
+#include <snmp_tiny.h>          // Mahan SNMP connection
+#include "snmp_mib.h"
+
+
+// Nur beim Paradigm
+#ifdef PARADIGM
+   #include "ApiI2C.h"
+#endif
+
+//--- CANOPEN --------
+#include "ixxtarg.h"
+#include "integral.h"
+#include "COPcfg.h"
+#include "appcfg.h"
+#include "cop.h"
+#include "DLL.h"
+#include "SDO.h"
+#include "crt.h"
+#include "GOEtypes.h"
+#include "OBD.h"
+#include "OBD_app.h"
+#ifndef SMALL_VERSION
+   #include <canopen.h>
+#endif
+//--------------------
+
+
+//--------------------------------------------------------
+// Typen
+//--------------------------------------------------------
+
+// Moduldaten
+typedef struct tagMY_APP
+{
+   BOOL                 bExitFlag;                    // glob. Flag für Threads
+   BOOL                 bSysReady;                    // System initialisiert
+   SHORT                sFault;                       // Fehler
+   CHAR                 szVersion[20];
+   CHAR                 szBuiltTime[20];
+   CHAR                 szBuiltDate[20];
+   CHAR                 szParaFileTime[30];
+   CHAR                 szRouteFileTime[30];
+   CHAR                 szFilename[100];
+   ULONG                aulBuf[100];                   // Buffer für Checksummen
+
+}MY_APP, *P_MY_APP;
+
+char msg_sendbuf[13];
+char msg_sendbuf2[13];
+
+
+// Statischer Pointer auf Applikations-Instanz
+static MY_APP MODDATA_FAR  App;
+
+// Applikationsende-Funktion des main()
+SHORT    MyApp_CreateDefaultPara    (P_AUTOVER_INIT_DATA pInitData);
+USHORT   MyApp_CreateAutoNbrFromIP  (ULONG ulIP);
+SHORT    MyApp_CheckIP              (P_AUTOVER_INIT_DATA pInitData);
+
+/******************************************************************************
+*D Diese Funktion startet alle Komponenten der Applikation
+**
+*P pInitData   [IN]  Daten der Kommandozeile
+**
+*R >=0 Okay
+*R <0  Fehler
+**
+*B 17.07.2006, el
+*H
+*H 28.10.2020, MB:  Go on booting although no Wifi device device is connected
+*H 02.05.2023, ROM: Save the NVD just before system ready (in case of PARADIGM version)
+*H 14.11.2023, ROM; The NVD will be saved after the first movement of the autoca
+*H                  In case of invalid NVD a fault message will be generated.
+*******************************************************************************/
+/* ==========================================================
+   SNMP Initialization Function
+   ========================================================== */
+SHORT MyApp_InitSNMP(VOID)
+{
+    P_API_THREAD gpSnmpUdpThread = NULL;   /* moved to top */
+    SHORT        rc              = 0;      /* moved to top */
+
+    if (!SNMP_Tiny_Init())
+    {
+        printf("[SNMP] ERROR: Tiny worker could not start\n");
+        return -1;
+    }
+
+    SNMP_MIB_AddOrUpdate("1.3.6.1.3.2026.1.0", "HelloSNMP");
+
+    rc = ApiThrd_Create(
+        &gpSnmpUdpThread,
+        SNMP_UDP_Thread_Wrapper,
+        30,      /* priority  */
+        2000,    /* stack size */
+        "SNMP"
+    );
+
+    if (rc == 0)
+    {
+        SNMP_Tiny_SetUdpThread(gpSnmpUdpThread);
+        printf("\n[SNMP] UDP listener started\n");
+    }
+    else
+    {
+        printf("\n[SNMP] ERROR: UDP listener could not be started\n");
+    }
+
+	return rc;
+}
+
+SHORT  MyApp (P_AUTOVER_INIT_DATA pInitData)
+{
+   SHORT    x                    = 0;
+   BOOL     bInitFault_RouteData = FALSE;
+
+   GLOSTORE_INIT_DATA GloStoreInit;
+   API_WLAN_CALL        WLanData;
+
+#ifndef WIN32
+      //ApiOS_Sleep(15000);
+#endif
+
+   memset(&App, 0, sizeof(App));
+   memset(&msg_sendbuf, 0, sizeof(msg_sendbuf));
+   memset(&msg_sendbuf2, 0, sizeof(msg_sendbuf2));
+   memset(&WLanData,0,sizeof(WLanData));
+
+   // Versionskennungen aufbauen
+   strncpy_s(App.szVersion,sizeof(App.szVersion),AUTOCA_VERSION,_TRUNCATE);
+   strncpy_s(App.szBuiltDate,sizeof(App.szBuiltDate),__DATE__,_TRUNCATE);
+   strncpy_s(App.szBuiltTime,sizeof(App.szBuiltTime),__TIME__,_TRUNCATE);
+
+   // soll die Simulation eingeschaltet sein ?
+   if (pInitData->bSim)
+   {
+      GloStore_SetSimulation();
+   }
+
+   App.bExitFlag   = FALSE;
+   App.sFault      = 0;                                  // Zunaechst ist alles in Butter
+   App.bSysReady   = FALSE;                              // System Initialisierung fertig (TRUE)
+
+   //-------------------------------------------------------------
+   // Komponenten init...
+   //--------------------------------------------------------------
+   ApiOS_SetStartData (x++, "Init Start",App.sFault);
+   ApiOS_SetStartData (x++, "(1)",FALSE);
+
+
+   //-------------------------------------------------------------
+   // IP der DLC kontrollieren, sollte diese nicht OK sein,
+   // so wird diese auf die default Werte der Chip.ini gesetzt
+   //--------------------------------------------------------------
+   MyApp_CheckIP(pInitData);
+
+
+   //--------------------------------------------------------
+   // Init aller Api's
+   //--------------------------------------------------------
+   if(App.sFault >=0)
+   {
+      // Thread Service Starten
+      App.sFault = ApiThrd();
+      ApiOS_SetStartData(x++, "Init Thread Api", App.sFault);
+   }
+   if(App.sFault>=0)
+   {
+      // Betriebssystemabhänge Funktionen
+      App.sFault = ApiOS(pInitData->bSimTick,pInitData->usAutoNbr);
+      ApiOS_SetStartData(x++, "Init Betriebssystem Api", App.sFault);
+   }
+   if(App.sFault >=0)
+   {
+      // Semaphoren Api installieren
+      App.sFault = ApiSem();
+      ApiOS_SetStartData(x++, "Init Semaphoren Api", App.sFault);
+   }
+   if(App.sFault>=0)
+   {
+      // Socket Api starten
+      App.sFault = ApiSock();                               // Api der Socket-Funktionen
+      ApiOS_SetStartData(x++, "Init Socket Api", App.sFault);
+   }
+#ifdef WIN32
+      if(App.sFault>=0)
+      {
+         // Funktion der CAN-Bus Simulation aktivieren
+         App.sFault= SimCan();
+         ApiOS_SetStartData(x++, "Init CAN-Bus Simulation", App.sFault);
+      }
+#endif
+
+   //--------------------------------------------------------
+   // Init der CAN Bus Api
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      App.sFault = ApiCan(pInitData->ulCanUdpIP,pInitData->usCanUdpPort);
+      ApiOS_SetStartData(x++, "Init CAN-Bus Api", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Hardwareabhängige CAN-Bus Funktionen starten
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      App.sFault = ApiRema(pInitData->usBasisPort,pInitData->usAutoNbr);
+      ApiOS_SetStartData(x++, "Init Api für Remanetdatenzugriff", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // ARP Tabellen zugriff initialisieren
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      // Zugriff
+      App.sFault = ApiArp();
+      ApiOS_SetStartData(x++, "Init Api für ARP-Table Zugriff", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Interne Modul-Kommunikation starten
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      App.sFault = DispPipe();                     // Inter - Modul-Kommunikation
+      ApiOS_SetStartData(x++, "Init Dispatch Pipe", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Loggingmodul starten
+   //--------------------------------------------------------
+   if(App.sFault >=0)
+   {
+      App.sFault = AutoLog(pInitData->usLogMode,pInitData->ulLogRangeStart,pInitData->ulLogRangeEnd);
+      ApiOS_SetStartData(x++, "Init Loggingmodul", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // XML Parser Starten
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      App.sFault = XMLP();
+      ApiOS_SetStartData(x++, "XML Parser Init", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Routendaten einlesen
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      // Toolboxmodul für Routendaten
+      App.sFault = ProfUtil(pInitData->szParaPath,pInitData->szRouteFile);
+      ApiOS_SetStartData(x++, "Init Routendaten Tools", App.sFault);
+      if ( ( App.sFault == -2 ) || (App.sFault == -3) ) // Wenn die Routendaten unbekannte Parameter enhalten den Fehler nur melden!
+      {
+         // Telnet Meldung
+         ApiOS_SetStartData(x++, "Routendaten: Fehler oder Unbekannte Variable", App.sFault);
+         // Fehler für spätes loggen setzen (siehe Ende dieser Funktion)
+         bInitFault_RouteData = TRUE;
+         // Fehler löschen!
+         App.sFault = 0;
+      }
+   }
+
+   //--------------------------------------------------------
+   // Anlegen der Autoca-Nummer
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      App.sFault = MyApp_CreateDefaultPara(pInitData);
+      ApiOS_SetStartData(x++, "Defaultwerte anlegen", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Parameterdaten einlesen
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      // Einlesen des Parameterfiles
+      App.sFault = Para(pInitData->usAutoNbr,pInitData->szParaPath,pInitData->szParaFile);
+      if(!App.sFault) ApiOS_SetStartData(x++, "Read Para File" , App.sFault);
+      else ApiOS_SetStartData(x++, Para_GetError(), App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Init aller Simulationskomponenten
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      // Initialisierung der CAN-Bus Kommunikation
+      // AUCH DIE SIMULANTEN BRAUCHEN CAN !!!!!!!!!
+      App.sFault= Can();
+      ApiOS_SetStartData(x++, "Init CAN-Bus Modul", App.sFault);
+   }
+   if(App.sFault>=0)
+   {
+      // Initialisierung von Global abgelegten Daten
+      // APParse bracht GlobalStore
+
+      strncpy_s(GloStoreInit.szParaPath,sizeof(GloStoreInit.szParaPath),pInitData->szParaPath,_TRUNCATE);           //Parameterpfad (Ablage von Routen- und Parameterfile)
+      GloStoreInit.ulIP = pInitData->ulIP;
+      GloStoreInit.usAutoNbr = pInitData->usAutoNbr;
+      GloStoreInit.bUseIac = pInitData->bUseIac;
+      App.sFault = GloStore(&GloStoreInit);            // Globaldaten init
+      ApiOS_SetStartData(x++, "Init Global und Remanentdaten", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // SEW WLan oder Bat-C Converter Api
+   // (Achtung diese Komponenten benötigen die RemaDaten sowie
+   //  das Routefile!)
+   //--------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      // Variablen Übergeben
+      WLanData.bSim              = pInitData->bSim;               // Ist das AC in Simulations AC?
+      WLanData.ulACIP            = GloStore_GetIp();              // Eigene IP Merken
+      WLanData.ulConvIP          = ProfUtil_GetWLanIP(0);         // Speichern der IP,
+      WLanData.ulConvSubnetMask  = ProfUtil_GetWLanSubnetMask();  // SubnetMask
+      WLanData.ulConvDefGateway  = ProfUtil_GetWLanGateWay();     // und des Default Gateway für den Converter
+      WLanData.CallbackLogger    = &WLan_Callback_Logging;        // Übergeben der CallBack Funktion zum Loggen
+
+      // Get WiFi related information for the WiFi module
+      ProfUtil_GetWLanSSID(WLanData.szWlanSSID, API_WLAN_SSID_SIZE);
+      ProfUtil_GetWLanEncryption(WLanData.szWlanEncryption, API_WLAN_ENCRYPTION_SIZE);
+      ProfUtil_GetWLanKey(WLanData.szWlanKey, API_WLAN_KEY_SIZE);
+
+      // Api WLan starten
+      App.sFault = ApiWLan(&WLanData);
+      ApiOS_SetStartData(x++, "Init WLan Api", App.sFault);
+   }
+
+   // -------------------------------------------------------------
+   // Starten der Simulations Kompunenten unter Windows
+   // -------------------------------------------------------------
+#ifdef WIN32
+      //if(App.sFault>=0)
+      //{
+      //   // Simulierte Wippen, Drucksystem, Klappem etc...
+      //   App.sFault = SimEA();
+      //   ApiOS_SetStartData(x++, "Init EA-Simualtion", App.sFault);
+      //}
+      if(App.sFault>=0)
+      {
+         // Simulierte EA-Erweiterung
+         App.sFault = SimExMod_EA(pInitData->bSim);
+         ApiOS_SetStartData(x++, "Init EA-Modul-Simulation", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         // Simulation des Fahrantries
+         App.sFault = SimFu1(pInitData->usCanUdpPort,pInitData->bSim);
+         ApiOS_SetStartData(x++, "Init Simulation Fahrantrieb", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         // Simulation des Querband-Antriebs
+         App.sFault = SimFU3(pInitData->usCanUdpPort,pInitData->bSim,pInitData->usAutoNbr);
+         ApiOS_SetStartData(x++, "Init Simulation Antrieb Querband/Kompressor", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         // Starten der PIC-Controller Simulation
+         App.sFault = SimPIC(pInitData->usCanUdpPort,pInitData->bSim);
+         ApiOS_SetStartData(x++, "Init Simulation PIC-Controller", App.sFault);
+      }
+   #endif
+
+   //--------------------------------------------------------
+   //Init aller zusätzlichen Module
+   //--------------------------------------------------------
+   if(App.sFault >= 0)
+   {
+      // Initialisierung der UDP-Kommunikation
+      App.sFault = Udp();                    // UDP Kommunikation
+      ApiOS_SetStartData(x++, "Init UDP Kommunikation", App.sFault);
+   }
+   if(App.sFault >= 0)
+   {
+      // Modul zur Behandlung von Taktspur-Unterbrechungen
+      App.sFault = UTB();                       // Codemarkenmodul
+      ApiOS_SetStartData(x++, "Init Unterbrechermodul", App.sFault);
+   }
+   if(App.sFault >= 0)
+   {
+      // Meldepunktverwaltung für UDP-Telegrammaustausch
+      App.sFault = MpWork();
+      ApiOS_SetStartData(x++, "Init Meldepunktverwaltung", App.sFault);
+   }
+   if(App.sFault >= 0)
+   {
+      App.sFault = TH_Tools();                       // Lastaufnahme System
+      ApiOS_SetStartData(x++, "Init Taskhandler Toolbox", App.sFault);
+   }
+   if(App.sFault >= 0)
+   {
+      App.sFault = JobList();                   // Auftragslisten
+      ApiOS_SetStartData(x++, "Init Joblisten-Modul", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Module zur Hardware-Ansteuerung
+   //--------------------------------------------------------
+   #ifndef SMALL_VERSION
+      if(App.sFault >= 0)
+      {
+         CanOpen(pInitData->bSim,pInitData->usCanUdpPort,pInitData->szParaPath);
+      }
+   #endif
+
+   if(App.sFault >= 0)
+   {
+      App.sFault = ExMod();
+      ApiOS_SetStartData(x++, "Init ExMod-Modul", App.sFault);
+   }
+   if(App.sFault >= 0)
+   {
+      App.sFault =  ExMod_EA();
+      ApiOS_SetStartData(x++, "Init ExMod_EA-Modul", App.sFault);
+   }
+
+   //--------------------------------------------------------
+   // Nur unter Paradigm wird das I²C Modul initialisiert!
+   //--------------------------------------------------------
+#ifdef PARADIGM
+      if (App.sFault >= 0)
+      {
+         // Starten des I2C Moduls
+         App.sFault = ApiI2C();
+         ApiOS_SetStartData(x++, "Init I2C-Modul", App.sFault);
+      }
+#endif
+
+   if(App.sFault>=0)
+   {
+      //Starten des EA Moduls zur Erfassung Wippen, Klappen etc.
+      App.sFault = EA(pInitData->usCanUdpPort);
+      ApiOS_SetStartData(x++, "Init EA-Modul", App.sFault);
+   }
+
+   // 2017-05-03 ~CW~ Testweise verschoben, da das Sim Modul die Bitmasken aus dem EA Mudul verwendet
+   #ifdef WIN32
+      if(App.sFault>=0)
+      {
+         // Simulierte Wippen, Drucksystem, Klappem etc...
+         App.sFault = SimEA();
+         ApiOS_SetStartData(x++, "Init EA-Simualtion", App.sFault);
+      }
+   #endif
+
+   if(App.sFault>=0)
+   {
+      //Ansteuerungsmodul für den Fahrantrieb
+      App.sFault = FU1(pInitData->usCanUdpPort);
+      ApiOS_SetStartData(x++, "Init Modul Fahrantrieb", App.sFault);
+   }
+
+   if(App.sFault>=0)
+   {
+      //Ansteuerungsmodul für den Querbandantrieb
+      App.sFault = FU3(pInitData->usCanUdpPort);
+      ApiOS_SetStartData(x++, "Init Modul Antrieb Querband/Kompressor", App.sFault);
+   }
+
+   if(App.sFault>=0)
+   {
+      //Ansteuerung des PIC-Controllers
+      App.sFault  = PIC(pInitData->usCanUdpPort);
+      ApiOS_SetStartData(x++, "Init Modul PIC-Controller", App.sFault);
+   }
+
+   if(App.sFault>=0)
+   {
+      //Zusatzfunktionen für SEW Unrichter
+      App.sFault = SEW();
+      ApiOS_SetStartData(x++, "Init Modul SEW", App.sFault);
+   }
+
+   if(App.sFault>=0)
+   {
+      //Start der Drucksystemsteuerung
+      App.sFault = DrSys();
+      ApiOS_SetStartData(x++, "Init Drucksystem", App.sFault);
+   }
+
+   if(App.sFault>=0)
+   {
+      //Start des Arp-Cache Handlings
+      App.sFault = Arp();
+      ApiOS_SetStartData(x++, "Arp-Tabellen Verwaltung", App.sFault);
+   }
+
+   if(App.sFault>=0)
+   {
+      // Den WLan-Converter-Service starten
+      App.sFault = WLan();
+      ApiOS_SetStartData(x++, "Init Modul WLan", App.sFault);
+   }
+
+   // -------------------------------------------------------------
+   // Start der Kommunikationstasks (nur starten wenn keine
+   // UDP<->CAN Funktion bei echten autoca)
+   // -------------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      if (App.sFault >= 0)
+      {
+         //Aufbau der Kommunikation Auto<->IAC durch Start einer UDP Task
+         if(GloStore_IacUsed())
+         {
+            App.sFault = ConIac (pInitData->usAutoNbr,pInitData->usBasisPort);
+            ApiOS_SetStartData(x++, "Init IaC Connection...",FALSE);
+         }
+      }
+      if (App.sFault >= 0)
+      {
+         //Aufbau der Kommunikation zum Beas durch Start einer UDP Task
+         App.sFault = ConBeAS(pInitData->usAutoNbr,pInitData->usBasisPort);
+         ApiOS_SetStartData(x++, "Init BeAS Connection...",FALSE);
+      }
+      if (App.sFault >= 0)
+      {
+         //Aufbau der Kommunikation Auto<->Auto durch Start einer UDP Task
+         App.sFault = ConAuto (pInitData->usAutoNbr,pInitData->usBasisPort);
+         ApiOS_SetStartData(x++, "Init autoca Connection...",FALSE);
+      }
+      if (App.sFault >= 0)
+      {
+         //Aufbau der Kommunikation Auto<->Remote Steuerung durch Start einer UDP Task
+         App.sFault = ConRemo (pInitData->usAutoNbr,pInitData->usBasisPort);
+         ApiOS_SetStartData(x++, "Init Remote Connection...",FALSE);
+      }
+   }
+
+   if (App.sFault >= 0)
+   {
+      AutoErr();
+   }
+
+   //--------------------------------------------------------
+   // Start der Funktionstasks DRIVE TASKS WORK IAC
+   //--------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      if(App.sFault>=0)
+      {
+         App.sFault = ModWork();                   // Modul Auftragsverfolgung
+         ApiOS_SetStartData(x++, "Init Modul WORK", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = ModTasks();                  // Modul Lastaufnahme
+         ApiOS_SetStartData(x++, "Init Modul TASKS", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = ModDrive();                  // Modul Fahren
+         ApiOS_SetStartData(x++, "Init Modul DRIVE", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = ModIac();                    // Modul Iac
+         ApiOS_SetStartData(x++, "Init Modul IAC", App.sFault);
+
+        
+         /* ---- SNMP INIT ---- */
+         
+
+         /* ---- START TASKS ---- */
+         
+      }
+   }
+
+   // -------------------------------------------------------------
+   // Start aller API Tasks
+   // -------------------------------------------------------------
+   if(App.sFault>=0)
+   {
+      App.sFault = ApiCan_StartTask();
+      ApiOS_SetStartData(x++, "ApiCan Start Task", App.sFault);
+   }
+   if(App.sFault>=0)
+   {
+      App.sFault = ApiOS_StartTask();
+      ApiOS_SetStartData(x++, "ApiOS Start Task", App.sFault);
+   }
+   // -------------------------------------------------------------
+   // Starten der Simulations Tasks unter Windows
+   // -------------------------------------------------------------
+#ifdef WIN32
+      if(App.sFault>=0)
+      {
+         App.sFault = SimPIC_StartTask();
+         ApiOS_SetStartData(x++, "SimPic Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = SimFU3_StartTask();
+         ApiOS_SetStartData(x++, "SimFU3 Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = SimFu1_StartTask();
+         ApiOS_SetStartData(x++, "SimFu1 Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = SimExMod_EA_StartTask();
+         ApiOS_SetStartData(x++, "SimExMod_EA Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = SimEA_StartTask();
+         ApiOS_SetStartData(x++, "SimEA Start Task", App.sFault);
+      }
+#endif
+
+   // -------------------------------------------------------------
+   // Start der Kommunikationstasks
+   // -------------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      // Abbau der Kommunikation zum Beas
+      if(App.sFault>=0)
+      {
+         App.sFault = ConRemo_StartTask();
+         ApiOS_SetStartData(x++, "ConRemo Start Task...",FALSE);
+      }
+
+      // schon hier das System Ready Flag setzen, damit im AppMgr der Systemstart etwas schneller erkannt wird
+      MyApp_SetSystemReady();
+
+      // Aufbau der Kommunikation Auto<->Auto
+      if(App.sFault>=0)
+      {
+         App.sFault = ConAuto_StartTask ();
+         ApiOS_SetStartData(x++, "ConAuto Start Task",FALSE);
+      }
+
+      // Aufbau der Kommunikation zum Beas
+      if(App.sFault>=0)
+      {
+         App.sFault = ConBeAS_StartTask();
+         ApiOS_SetStartData(x++, "ConBeAS Start Task...",FALSE);
+      }
+
+      // Aufbau der Kommunikation Auto<->IAC
+      if(GloStore_IacUsed())
+      {
+         if(App.sFault>=0)
+         {
+            App.sFault = ConIac_StartTask ();
+            ApiOS_SetStartData(x++, "ConIac Start Task",FALSE);
+         }
+      }
+
+      #ifndef SMALL_VERSION
+         // Start der CanOpen Tasks
+         if(App.sFault>=0)
+         {
+            if(CanOpen_IsActive())
+            {
+               // Tasks nur starten wenn Modul aktiv, zeitraubend für Emulation
+               App.sFault = CanOpen_StartTask();
+               ApiOS_SetStartData(x++, "Init Modul CANOpen", App.sFault);
+            }
+         }
+      #endif
+   }
+
+   //--------------------------------------------------------
+   // Start der Funktionstasks
+   //--------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      if(App.sFault>=0)
+      {
+         App.sFault = ModIac_StartTask();
+         ApiOS_SetStartData(x++, "IAC Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = ModDrive_StartTask();
+         ApiOS_SetStartData(x++, "DRIVE Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = ModTasks_StartTask();
+         ApiOS_SetStartData(x++, "TASKS Start Task", App.sFault);
+      }
+      if(App.sFault>=0)
+      {
+#ifdef PARADIGM
+         // 08.04.2014 ROM
+         // Durch die neue DLC ist der Bootvorgang schneller, es werden also ehr CB-Meldungen gesendet,
+         // obwohl die (der) FU noch nicht im Automatik-Modus sind (ist),
+         // Es wird eine Fehlermeldung des BeAS generiert und eine (Nach-)Start der Anlage misslingt!!!
+         // Also eine (kleine) Wartezeit einbauen. Es kann hier nicht auf den Status des FU gewartet werden, sonst werden keine
+         // Meldungen abgesetzt, falls der FU einen Fehler hat.
+         ApiOS_Sleep(1500);
+#endif
+      }
+      // Start WLan Task //07.05.2018, MB: Shift a little bit to the back to win time
+      if(App.sFault>=0)
+      {
+         App.sFault = WLan_Open();
+         ApiOS_SetStartData(x++, "WLan Init Converter", App.sFault);
+         App.sFault = 0; //28.10.2020, MB: Go on booting although no Wifi device device is connected
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = WLan_StartTask();
+         ApiOS_SetStartData(x++, "WLan Start Task",FALSE);
+      }
+      if(App.sFault>=0)
+      {
+         App.sFault = ModWork_StartTask();
+         ApiOS_SetStartData(x++, "WORK Start Task", App.sFault);
+      }
+   }
+
+#ifdef PARADIGM
+   // Change the 'Hosenträger' identifier to 2 to avoid beaming of an autoca if the NVD saving don't works at the end of application runtime.
+   // 27.10.2023 ROM obsolete, the writing will be done after the first move of the autoca ApiRema_Write_BeforeReady();
+#endif
+
+
+     //------------------------------------------------------
+   // Start SNMP Tiny Agent (optional, non-critical)
+   // SNMP is used for monitoring only. If it fails to start,
+   // the autoca continues to run normally without SNMP.
+   // The error is logged in the boot log for diagnostics.
+   //------------------------------------------------------
+   if (App.sFault >= 0)
+   {
+       SHORT sSnmpRc = 0;
+
+       ApiOS_SetStartData(x++, "Try Start SNMP Tiny Agent...", FALSE);
+       sSnmpRc = MyApp_InitSNMP();
+
+       if (sSnmpRc < 0)
+       {
+           // SNMP failed — log it but do NOT stop the autoca
+           ApiOS_SetStartData(x++, "SNMP failed (non-critical)", sSnmpRc);
+           printf("[SNMP] WARNING: SNMP not available, autoca continues\n");
+       }
+       else
+       {
+           ApiOS_SetStartData(x++, "SNMP Tiny Agent started", FALSE);
+       }
+       // Result is NOT written to App.sFault because SNMP
+       // is not essential for autoca operation.
+       // Same approach as WLan (see WLan_Open above).
+   }
+   
+
+   // ------------------------------------------------------
+   // System ready
+   // ------------------------------------------------------
+   if (App.sFault >= 0)
+   {
+      // etwas warten bis das System vollständig auf die Füße gekommen ist
+      ApiOS_Sleep(2000);
+
+      // Freigabe von Störmeldungen
+      AutoErr_Enable();
+
+      // Meldung absetzen
+      ApiOS_SetStartData (100, "Init OK autoca läuft...",FALSE);
+
+      // If the ND data is invalid and the position is set to 0/0/0 send a fault message to inform the supervisor
+      if ( !GloStore_IsRemaValid() )
+      {
+         AutoErr_SetClear( AUTOERR_NVD_SAVE_FAULT, TRUE, NULL );
+      }
+
+      // Nachträglich noch den Fehler vom einlesen der Routenfile löschen
+      if(bInitFault_RouteData)
+      {
+         // (L) "ac-#-: MyAPP Fault or Unknown Parameter in Parmeterfile found!"
+         BE_LogMsg(43101, AUTO_LOG_NORMAL, "@3#%u#",GloStore_GetAutoNbr());
+      }
+   }
+   else
+   {
+      //-------------------------------------------------------------------------//
+      // Systemstart Fehler, System beenden
+      //-------------------------------------------------------------------------//
+      Main_AppExit();  // Programm wie durch Tastendruck abschießen
+
+      ApiOS_Sleep(5000);
+
+      // Meldung absetzen
+      ApiOS_SetStartData (100, "Init autoca läuft nicht!!!",FALSE);
+   }
+
+   return (App.sFault);
+}
+
+
+//////////////////////////////////////////////////////////////////////
+// Init / Exit Flag
+//////////////////////////////////////////////////////////////////////
+
+
+/******************************************************************************
+*D Setzt das Exit-Flag zum Beenden der Applikation
+**
+*B 93.09.03 WR
+*******************************************************************************/
+VOID  MyApp_SetExitFlag( VOID )
+{
+   App.bExitFlag = TRUE;
+}
+
+
+/******************************************************************************
+*D Abfrage des Exit-Flag
+**
+*R TRUE Exit-Flag gesetzt
+**
+*B 09.09.03 WR
+*******************************************************************************/
+BOOL  MyApp_IsExitFlag( VOID )
+{
+   return (App.bExitFlag);
+}
+
+
+/******************************************************************************
+*D Setzt das Init Ready Flag
+**
+*B 09.09.2003 WR
+*******************************************************************************/
+VOID  MyApp_SetSystemReady( void )
+{
+   App.bSysReady = TRUE;
+}
+
+
+/******************************************************************************
+*D Fragt ab, ob das System initialisiert ist
+**
+*R TRUE->init Ready FALSE->init nicht fertig
+**
+*B 09.09.2003 WR
+*******************************************************************************/
+BOOL  MyApp_IsSystemReady( void )
+{
+   return (App.bSysReady);
+}
+
+
+/******************************************************************************
+*D Pointer auf die Systemstruktur
+**
+*B 23.09.2003  WR
+*******************************************************************************/
+P_MY_APP       GetMyAppPtr ( void )
+{
+   return (&App);
+}
+
+
+/******************************************************************************
+*D Diese Funktion füllt alle nicht durch den Parameterstring übergebenen
+*D Parmeter mit Defaultwerten
+**
+*P pInitData [IN]    Sammlung der eingelesenen Kommandozeilenparameter
+**
+*R >=0   Okay
+*R <0    Fehler
+**
+*B 11.02.2005, el
+*H 30.03.2020, ROM  Get the autoca number (from a real autoca) only from the 
+*H                  ProfUtil_CalcCarID() methode to be able to work with autoca
+*H                  IDs greater than 255
+*******************************************************************************/
+SHORT MyApp_CreateDefaultPara (P_AUTOVER_INIT_DATA pInitData)
+{
+   SHORT   sRC = 0;
+
+   if(pInitData->szParaPath[0]=='\0')
+   {
+      strncpy_s(pInitData->szParaPath,sizeof(pInitData->szParaPath),"B:\\PARAM",_TRUNCATE);
+   }
+
+   // "0" heißt Autonummer aus IP-Setup der Routendaten generieren
+   if(pInitData->usAutoNbr == 0)
+   {
+      pInitData->usAutoNbr = ProfUtil_CalcCarID(pInitData->ulIP);
+
+      //falls das mit dem IPSetup nicht geklappt hat
+      //nach der alten Methode die Autonummer generieren
+      
+      // 30.03.2020 ROM
+      // Disable the following code to avoid double car IDs in case of more than 255 autoca in the system.
+      // E.g autoca with the following IP addresses would have the same car ID.
+      // 10.7.253.88
+      // 10.7.254.88
+      //
+      //if(!pInitData->usAutoNbr)
+      //{
+      //   pInitData->usAutoNbr = MyApp_CreateAutoNbrFromIP(pInitData->ulIP);
+      //}
+   }
+
+   if(!pInitData->usAutoNbr)
+   {
+      sRC = -1;
+   }
+
+   return sRC;
+}
+
+
+/******************************************************************************
+*D Diese Funktion erzeugt die Autonummer aus der letzten Stelle der IP-Adresse
+*D 0..0..0.101 = Auto 1
+*D 0..0..0.102 = Auto 2
+*D 0..0..0.103 = Auto 3
+*D 0..0..0.104 = Auto 4
+**
+*P ulIP     [IN]     IP-Adresse des Autos
+**
+*R ~???~
+**
+*B 11.02.2005, el
+*H
+*******************************************************************************/
+USHORT   MyApp_CreateAutoNbrFromIP  (ULONG ulIP)
+{
+   char     szIP[MAX_IP_LEN];
+   char    *pszIP             = &szIP[MAX_IP_LEN-1];
+   SHORT    sAutoNbr          = 0;
+
+   ApiSock_InetToAscii(ulIP,szIP,sizeof(szIP));
+
+   //den dritten "." suchen
+   while(*(--pszIP) != '.') ;
+
+   sAutoNbr = (SHORT)atol(++pszIP);
+
+   if(sAutoNbr > 100)
+   {
+      sAutoNbr -= 100;
+   }
+
+   return (USHORT)sAutoNbr;
+}
+
+
+/******************************************************************************
+*D Auslesen der Versionskennung der exe
+**
+*R Versionskennung als String
+**
+*B 05.01.2006, el
+*H
+*******************************************************************************/
+CHAR*        MyApp_GetVersion     (VOID)
+{
+   return App.szVersion;
+}
+
+
+/******************************************************************************
+*D Auslesen der Erstellungsuhrzeit der exe.
+*D (Ermittelt durch das Makro __TIME__)
+**
+*R String entsprechend __TIME__ vom Kompiler generiert
+**
+*B 05.01.2006, el
+*H
+*******************************************************************************/
+CHAR*       MyApp_GetBuiltTime   (VOID)
+{
+   return App.szBuiltTime;
+}
+
+
+/******************************************************************************
+*D Auslesen des Erstellunsdatums der exe entsprechend dem Makro __DATE__
+**
+*R String durch Makro __DATE__ vom Kompiler generiert
+**
+*B 05.01.2006, el
+*H
+*******************************************************************************/
+CHAR*       MyApp_GetBuiltDate   (VOID)
+{
+   return App.szBuiltDate;
+}
+
+
+/******************************************************************************
+*D Applikationsende
+**
+*R 0  = Okay
+*R <0 = Fehler
+**
+*B 02.08.2006, el
+*H 31.08.2015 ROM, ApiOS_SetResetISR() für die Deinstallation der ISR eingefügt. 
+*******************************************************************************/
+SHORT  _MyApp (P_AUTOVER_INIT_DATA pInitData)
+{
+   SHORT sRC = 0;
+   USHORT x=0;
+
+   MyApp_SetExitFlag();
+
+   printf ( "\nCleanUp!");
+
+   //--------------------------------------------------------
+   // Clean Up SNMP Tiny
+   //--------------------------------------------------------
+
+   SNMP_Tiny_Done();   /* Signal both SNMP threads to stop */
+
+   //--------------------------------------------------------
+   // Ende der Funktionstasks
+   //--------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      App.sFault = ModIac_EndTask();
+      ApiOS_SetStartData(x++, "IAC End Task", App.sFault);
+
+      App.sFault = ModDrive_EndTask();
+      ApiOS_SetStartData(x++, "DRIVE End Task", App.sFault);
+
+      App.sFault = ModTasks_EndTask();
+      ApiOS_SetStartData(x++, "TASKS End Task", App.sFault);
+
+      App.sFault = ModWork_EndTask();
+      ApiOS_SetStartData(x++, "WORK End Task", App.sFault);
+   }
+
+   // -------------------------------------------------------------
+   // Ende der Kommunikationstasks
+   // -------------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      // Abbau der Kommunikation Auto<->Remote
+      App.sFault = ConRemo_EndTask ();
+      ApiOS_SetStartData(x++, "ConRemo End Task",FALSE);
+
+      // Abbau der Kommunikation Auto<->Auto
+      App.sFault = ConAuto_EndTask ();
+      ApiOS_SetStartData(x++, "ConAuto End Task",FALSE);
+
+      // Abbau der Kommunikation zum Beas
+      App.sFault = ConBeAS_EndTask();
+      ApiOS_SetStartData(x++, "ConBeAS End Task...",FALSE);
+
+      // Abbau der Kommunikation Auto<->IAC
+      if(GloStore_IacUsed())
+      {
+         App.sFault = ConIac_EndTask ();
+         ApiOS_SetStartData(x++, "ConIac End Task",FALSE);
+      }
+
+      #ifndef SMALL_VERSION
+         // Ende CanOpen Tasks
+         if(CanOpen_IsActive())
+         {
+            App.sFault = CanOpen_EndTask();
+            ApiOS_SetStartData(x++, "CANOpen End Task", FALSE);
+         }
+      #endif
+
+      // Ende WLan Task
+      App.sFault = WLan_EndTask();
+      ApiOS_SetStartData(x++, "WLan End Task",FALSE);
+   }
+
+   // -------------------------------------------------------------
+   // Ende der Simulationstasks
+   // -------------------------------------------------------------
+#ifdef WIN32
+      //Starten der PIC-Controller Simulation
+      App.sFault = SimPIC_EndTask();
+      ApiOS_SetStartData(x++, "SimPic EndTask", App.sFault);
+
+      App.sFault = SimFU3_EndTask();
+      ApiOS_SetStartData(x++, "SimFU3 EndTask", App.sFault);
+
+      App.sFault = SimFu1_EndTask();
+      ApiOS_SetStartData(x++, "SimFu1 End Task", App.sFault);
+
+      App.sFault = SimExMod_EA_EndTask();
+      ApiOS_SetStartData(x++, "SimExMod_EA EndTask", App.sFault);
+
+      App.sFault = SimEA_EndTask();
+      ApiOS_SetStartData(x++, "SimEA End Task", App.sFault);
+#endif
+
+   // -------------------------------------------------------------
+   // Ende der API Tasks
+   // -------------------------------------------------------------
+   App.sFault = ApiCan_EndTask();
+   ApiOS_SetStartData(x++, "ApiCan End Task", App.sFault);
+
+   App.sFault = ApiOS_EndTask();
+   ApiOS_SetStartData(x++, "ApiOS End Task", App.sFault);
+
+   // -------------------------------------------------------------
+   // alle Komponenten abbauen
+   // -------------------------------------------------------------
+
+   // -------------------------------------------------------------
+   // Start der Kommunikationstasks (nur starten wenn keine
+   // UDP<->CAN Funktion bei echten autoca)
+   // -------------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      App.sFault = _WLan();
+      ApiOS_SetStartData(x++, "WLan-Converter abbauen ...", App.sFault);
+
+      //Aufbau der Kommunikation Auto<->IAC durch Start einer UDP Task
+      if(GloStore_IacUsed())
+      {
+         App.sFault = _ConIac ();
+         ApiOS_SetStartData(x++, "IaC Connection abbauen ...",FALSE);
+      }
+
+      //Aufbau der Kommunikation zum Beas
+      App.sFault = _ConBeAS();
+      ApiOS_SetStartData(x++, "BeAS Connection abbauen ...",FALSE);
+
+      //Aufbau der Kommunikation Auto<->Auto
+      App.sFault = _ConAuto ();
+      ApiOS_SetStartData(x++, "autoca Connection abbauen ...",FALSE);
+
+      //Aufbau der Kommunikation Auto<->Remote
+      App.sFault = _ConRemo ();
+      ApiOS_SetStartData(x++, "autoca Connection abbauen ...",FALSE);
+   }
+
+   App.sFault = _AutoErr();
+
+   // -------------------------------------------------------------
+   // Das ExitFlag in der WLan Task setzen, zum weiterreichen an die
+   // API's
+   // -------------------------------------------------------------
+   WLan_SetExitFalg();
+   ApiOS_SetStartData(x++, "Set Exit WLan Task",FALSE);
+
+
+   //--------------------------------------------------------
+   // Start der Funktionstasks DRIVE TASKS WORK IAC
+   //--------------------------------------------------------
+   if(GloStore_GetSimulation() ||
+      !GloStore_GetSimulation() && !pInitData->usCanUdpPort)
+   {
+      App.sFault = _ModWork();                   // Modul Auftragsverfolgung
+      ApiOS_SetStartData(x++, "Modul WORK abbauen ...", App.sFault);
+
+      App.sFault = _ModTasks();                  // Modul Lastaufnahme
+      ApiOS_SetStartData(x++, "Modul TASKS abbauen ...", App.sFault);
+
+      App.sFault = _ModDrive();                  // Modul Fahren
+      ApiOS_SetStartData(x++, "Modul DRIVE abbauen ...", App.sFault);
+
+      App.sFault = _ModIac();                    // Modul Iac
+      ApiOS_SetStartData(x++, "Modul IACv", App.sFault);
+   }
+
+   // ARP Tabellenverwaltung
+   App.sFault = _Arp();
+   ApiOS_SetStartData(x++, "Arp Verwaltung abbauen", App.sFault);
+
+   // Start der Drucksystemsteuerung
+   App.sFault = _DrSys();
+   ApiOS_SetStartData(x++, "DrSys abbauen", App.sFault);
+
+   // Zusatzfunktionen für SEW Unrichter
+   App.sFault = _SEW();
+   ApiOS_SetStartData(x++, "SEW abbauen", App.sFault);
+
+   // Ansteuerung des PIC-Controllers
+   App.sFault  = _PIC();
+   ApiOS_SetStartData(x++, "PIC abbauen", App.sFault);
+
+   // Ansteuerungsmodul für den Querbandantrieb
+   App.sFault = _FU3();
+   ApiOS_SetStartData(x++, "FU3 abbauen", App.sFault);
+
+   // Ansteuerungsmodul für den Fahrantrieb
+   ApiOS_SetStartData(x++, "FU1 abbauen", App.sFault);
+   App.sFault = _FU1();
+
+   //Starten des EA Moduls zur Erfassung Wippen, Klappen etc.
+   App.sFault = _EA();
+   ApiOS_SetStartData(x++, "EA abbauen", App.sFault);
+
+   //App.sFault = _AccSense();
+   //ApiOS_SetStartData(x++, "AccSense abbauen", App.sFault);
+
+   App.sFault =  _ExMod_EA();
+   ApiOS_SetStartData(x++, "ExMod_EA abbauen", App.sFault);
+
+   App.sFault = _ExMod();
+   ApiOS_SetStartData(x++, "ExMod abbauen", App.sFault);
+
+#ifdef PARADIGM
+   App.sFault = _ApiI2C();
+   ApiOS_SetStartData(x++, "I2C abbauen", App.sFault);
+#endif
+   //--------------------------------------------------------
+   // Module zur Hardware-Ansteuerung
+   //--------------------------------------------------------
+   #ifndef SMALL_VERSION
+      App.sFault = _CanOpen();
+      ApiOS_SetStartData(x++, "CanOpen abbauen", App.sFault);
+   #endif
+   App.sFault = _JobList();                   // Auftragslisten
+   ApiOS_SetStartData(x++, "JobList abbauen", App.sFault);
+
+   App.sFault = _TH_Tools();                       // Lastaufnahme System
+   ApiOS_SetStartData(x++, "TH_Tools abbauen", App.sFault);
+
+   App.sFault = _MpWork();
+   ApiOS_SetStartData(x++, "MpWork abbauen", App.sFault);
+
+   App.sFault = _UTB();                       // Codemarkenmodul
+   ApiOS_SetStartData(x++, "UTB abbauen", App.sFault);
+
+   //Initialisierung der UDP-Kommunikation
+   App.sFault = _Udp();                    // UDP Kommunikation
+   ApiOS_SetStartData(x++, "UDP abbauen", App.sFault);
+
+#ifdef WIN32
+   //--------------------------------------------------------
+   // Abbau aller Simulationskomponenten
+   //--------------------------------------------------------
+
+   //Starten der PIC-Controller Simulation
+   App.sFault = _SimPIC();
+   ApiOS_SetStartData(x++, "SimPIC abbauen", App.sFault);
+
+   //Simulation des Querband-Antriebs
+   App.sFault = _SimFU3();
+   ApiOS_SetStartData(x++, "SimFU3 abbauen", App.sFault);
+
+   //Simulation des Fahrantries
+   App.sFault = _SimFu1();
+   ApiOS_SetStartData(x++, "SimFU1 abbauen", App.sFault);
+
+   // Simulierte EA-Erweiterung
+   App.sFault = _SimExMod_EA();
+   ApiOS_SetStartData(x++, "SimExMod_EA abbauen", App.sFault);
+
+   // Simulierte Wippen,Drucksystem,Klappem etc...
+   App.sFault = _SimEA();
+   ApiOS_SetStartData(x++, "SimEA abbauen", App.sFault);
+
+#endif
+
+   // Initialisierung von Global abgelegten Daten
+   // APParse bracht GlobalStore
+   App.sFault = _GloStore();            // Globaldaten init
+   ApiOS_SetStartData(x++, "GloStore abbauen", App.sFault);
+
+   App.sFault= _Can();
+   ApiOS_SetStartData(x++, "CAN abbauen", App.sFault);
+
+   App.sFault = _Para();
+   ApiOS_SetStartData(x++, "Para abbauen", App.sFault);
+
+   App.sFault = _ProfUtil();
+   ApiOS_SetStartData(x++, "ProfUtil abbauen", App.sFault);
+
+   App.sFault = _XMLP();
+   ApiOS_SetStartData(x++, "XMLP abbauen", App.sFault);
+
+   // Loggingmodul starten
+   App.sFault = _AutoLog();
+   ApiOS_SetStartData(x++, "Init Loggingmodul", App.sFault);
+
+
+   // interne Modul-Kommunikation starten
+   App.sFault = _DispPipe();                     // Inter - Modul-Kommunikation
+   ApiOS_SetStartData(x++, "DispPipe abbauen", App.sFault);
+
+   //--------------------------------------------------------
+   // Abbau aller Api's
+   //--------------------------------------------------------
+   App.sFault = _ApiArp();
+   ApiOS_SetStartData(x++, "ApiArp abbauen", App.sFault);
+
+   App.sFault = _ApiRema();
+   ApiOS_SetStartData(x++, "ApiRema abbauen", App.sFault);
+
+   App.sFault = _ApiCan();
+   ApiOS_SetStartData(x++, "ApiCan abbauen", App.sFault);
+
+#ifdef WIN32
+      App.sFault= _SimCan();
+      ApiOS_SetStartData(x++, "SimCan abbauen", App.sFault);
+#endif
+
+   // Api der Socket-Funktionen
+   App.sFault = _ApiSock();
+   ApiOS_SetStartData(x++, "ApiSock abbauen", App.sFault);
+
+   App.sFault = _ApiWLan();
+   ApiOS_SetStartData(x++, "ApiWLan", App.sFault);
+
+   App.sFault = _ApiSem();
+   ApiOS_SetStartData(x++, "ApiSem abbauen", App.sFault);
+
+   // Jetzt die ISR deinstallieren  28.08.2015 ROM
+   ApiOS_SetResetISR(FALSE);
+
+   App.sFault = _ApiOS();
+   ApiOS_SetStartData(x++, "ApiOS abbauen", App.sFault);
+
+   App.sFault = _ApiThrd();
+   ApiOS_SetStartData(x++, "ApiThrd abbauen", App.sFault);
+
+
+   // Endmeldung
+   printf ( "\nCleanUp Erfolgreich! \n");
+
+   return sRC;
+}
+
+
+VOID MyApp_TaskInfo (VOID)
+{
+   INT 	iError  	   = 0;
+   INT 	iIdx    	   = 0;
+   INT 	iResult 	   = 0;
+   UINT 	uiLoad 	   = 0;
+   CHAR  szTmp[100]  = "";
+
+#ifdef PARADIGM
+   TaskList gTaskList[35];
+   Task_StateData gTaskStateData;
+
+   // Get list of tasks on the system
+   iResult = RTX_Get_Task_List(gTaskList, 35);
+
+   // Read task status
+   for (iIdx = 0; iIdx < iResult; iIdx++)
+   {
+      RTX_Get_Task_State(gTaskList[iIdx].taskname, &gTaskStateData, &iError);
+
+      if (iError == 0)
+      {
+         if (!strncmp(gTaskList[iIdx].taskname, "*DRV", sizeof(gTaskList[iIdx].taskname)) ||
+             !strncmp(gTaskList[iIdx].taskname, "*I2C", sizeof(gTaskList[iIdx].taskname)) ||
+             !strncmp(gTaskList[iIdx].taskname, "*TSK", sizeof(gTaskList[iIdx].taskname)))
+         {
+            snprintf_s(szTmp, (size_t)sizeof(szTmp), _TRUNCATE, "TASKS %s ID %04d Prio %3d Cnt %04d Stack %5d Used %02d%%",
+               gTaskList[iIdx].taskname,
+               gTaskStateData.taskID,
+               gTaskStateData.taskPrio,
+               gTaskStateData.taskCount,
+               gTaskStateData.stacksize,
+               gTaskStateData.stackused);
+
+            printf("\n%s", szTmp);
+
+            // (L) "ac-#-: #"
+            BE_LogMsg(45999, AUTO_LOG_DEBUG, "@1#%hu#%s#", GloStore_GetAutoNbr(), szTmp );
+         }
+
+         uiLoad += gTaskStateData.taskCount;
+      }
+      else
+      {
+         printf("\nTask %s not found or monitoring not enabled Err %d",
+            gTaskList[iIdx].taskname,
+            iError);
+      }
+   }
+
+   snprintf_s(szTmp, (size_t)sizeof(szTmp), _TRUNCATE, "TASKS CPU load %d%% ", uiLoad / 100);
+
+   printf("\n%s", szTmp);
+
+   // (L) "ac-#-: #"
+   BE_LogMsg(45999, AUTO_LOG_DEBUG, "@1#%hu#%s#", GloStore_GetAutoNbr(), szTmp );
+#else
+   iError   = iError;
+   iIdx     = iIdx;
+   iResult 	= iResult;
+   uiLoad 	= uiLoad;
+   szTmp[0] = '\0';
+#endif
+
+}
+
+
+/******************************************************************************
+*D Diese Funktion überprüft beim Starten ob die DLC IP noch der Richtigen IP
+*D entspricht, sollte dies nicht der Fall sein wird die IP geändert. 
+*D Siehe Chip.ini [AUTOCA]
+*D Eingeführt weil der Bat-C Suchlauf unter umständen die IP verändern konnte!
+**
+*P VOID
+**
+*R  0 Okay oder Datensatz nicht gefunden
+*R <0 Fehler
+**
+*B 28.01.2015, ~CW~
+*H
+*******************************************************************************/
+SHORT MyApp_CheckIP (P_AUTOVER_INIT_DATA pInitData)
+{
+   // Variables
+   char  szIP[20]             = "";    // Speicher für IP
+   char  szNetMask[20]        = "";    // Speicher für SubNetMask
+   char  szGate[20]           = "";    // Speicher für Gateway
+   char  szDefaultIP[20]      = "";    // Speicher für default IP
+   char  szDefaultNetMask[20] = "";    // Speicher für default SubNetMask
+   char  szDefaultGate[20]    = "";    // Speicher für default Gateway
+   short sRC                  = 0;     // Return Variable
+
+   // Default IP-Adresse aus Chip.ini auslesen, damit im Fall von einer Verstellten IP durch den Bat-C diese Restored werden kann
+   sRC = ApiOS_Get_Ini_String("AUTOCA", "DEF_IP", szDefaultIP, sizeof(szDefaultIP));
+   //printf("\nIP.ini:%s",szDefaultIP);
+   //printf("\nIPMem:%lx",pInitData->ulIP);
+
+   // Funktion okay and String gefunden?
+   if(sRC == 0 && szDefaultIP[0] != '\0') 
+   {
+      // Aktuelle Config Laden
+      ApiSock_Get_Settings(szIP,sizeof(szIP),szNetMask,sizeof(szNetMask),szGate,sizeof(szGate));
+      //printf("\nIP:%s",szIP);
+      //printf("\nNET:%s",szNetMask);
+      //printf("\nGATE:%s",szGate);     
+
+      // IP Vergleichen (Ist/Soll)
+      if(strcmp(szDefaultIP,szIP) != 0)
+      {
+         // Restliche Soll Daten aus der Chip.ini lesen
+         sRC = ApiOS_Get_Ini_String("AUTOCA", "DEF_SUBNET", szDefaultNetMask, sizeof(szDefaultNetMask));
+         if(!sRC)
+            sRC = ApiOS_Get_Ini_String("AUTOCA", "DEF_GATE", szDefaultGate, sizeof(szDefaultGate));
+         
+         // IP Ist NICHT gleich! Die IP wird auf die Default Werte der Chip.ini zurück gesetzt
+         if(!sRC)
+         {
+            // Prüfen ob alle default Werte aus der Chip.ini gelesen werden konnten 
+            if((szDefaultIP[0] != '\0') && (szDefaultNetMask[0] != '\0') && (szDefaultGate[0] != '\0'))
+            {
+               // Ändern der chip.ini Daten
+               sRC = ApiSock_Change_Settings(szDefaultIP, szDefaultNetMask, szDefaultGate);
+
+               // Internen Speichern ändern
+               ApiSock_AsciiToInet(szDefaultIP,&(pInitData->ulIP));
+               //printf("\nIPMem:%lx",pInitData->ulIP);
+
+               // Setzen der IP erfolgreich
+               if(!sRC)
+               {
+                  //printf("\n Ändern erfolgreich, Sleep");
+                  ApiOS_Sleep(3000);
+               }
+            }
+         }
+      }
+   }
+
+   return sRC;
+}
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+* snmp_tiny.h
+*
+* Interface for the SNMP Tiny subsystem.
+*
+* Responsibilities:
+*   - Maintains shared SNMP context (worker + UDP listener)
+*   - Provides control (stop flag, thread handles)
+*   - Starts the worker thread that updates the MIB every 2 seconds
+*   - Provides wrapper access to the UDP listener
+*******************************************************************************/
+
+#ifndef __SNMP_TINY_H__
+#define __SNMP_TINY_H__
+
+#include <ApiOS.h>
+#include <ApiThrd.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+    /******************************************************************************
+    * SNMP_TINY_CTX
+    *
+    * Shared context used by both SNMP threads.
+    * Contains:
+    *   - tinyThreadPtr : Worker thread handle
+    *   - udpThreadPtr  : UDP listener thread handle
+    *   - bStopFlag     : Set TRUE to request both threads to stop
+    *******************************************************************************/
+    typedef struct _SNMP_TINY_CTX
+    {
+        P_API_THREAD tinyThreadPtr;   /* Background worker thread      */
+        P_API_THREAD udpThreadPtr;    /* UDP listener thread           */
+        BOOL         bStopFlag;       /* TRUE = stop both SNMP threads */
+    } SNMP_TINY_CTX;
+
+
+    /******************************************************************************
+    * Lifecycle functions
+    *******************************************************************************/
+
+    /* Initialize SNMP subsystem:
+       - Reset context
+       - Init MIB
+       - Seed demo OID
+       - Start Tiny worker thread */
+    BOOL SNMP_Tiny_Init(VOID);
+
+    /* Shut down SNMP subsystem:
+       - Set stop flag
+       - Allow threads to exit
+       - Clean MIB */
+    VOID SNMP_Tiny_Done(VOID);
+
+
+    /******************************************************************************
+    * Worker thread
+    * Runs until stop flag is set.
+    *******************************************************************************/
+    UINT SNMP_Tiny_Thread(VOID);
+
+
+    /******************************************************************************
+    * Control helpers
+    *******************************************************************************/
+    VOID SNMP_Tiny_SetUdpThread(P_API_THREAD udpThreadPtr);
+    VOID SNMP_Tiny_SetStopflag(BOOL bStopFlag);
+    BOOL SNMP_Tiny_GetStopflag(VOID);
+
+
+    /******************************************************************************
+    * UDP listener entry points (from snmp_udp.c)
+    *******************************************************************************/
+    UINT SNMP_UDP_Thread(VOID);
+    VOID SNMP_UDP_Thread_Wrapper(VOID);
+
+
+    /******************************************************************************
+    * Legacy compatibility stubs (do nothing)
+    *******************************************************************************/
+    VOID SNMP_Tiny(VOID);
+    VOID _SNMP_Tiny(VOID);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __SNMP_TINY_H__ */
+
+
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+* snmp_tiny.c
+*
+* Background manager for the SNMP subsystem.
+*
+* What this file does:
+*   - Starts a heartbeat thread ("SNTY") that runs every 2 seconds
+*   - Each cycle, it increments a tick counter and writes it to the MIB
+*   - An SNMP manager can read this tick to verify the autoca is alive
+*   - Uses a wrapper function so the thread matches the RTOS signature
+*   - Registers standard SNMPv2-MIB OIDs (sysDescr, sysName, sysLocation)
+*
+* How it fits in the system:
+*   - MyApp.c calls SNMP_Tiny_Init() during boot (non-critical)
+*   - MyApp.c calls SNMP_Tiny_Done() during shutdown
+*   - snmp_udp.c uses the stop flag from this module
+*   - snmp_mib.c stores the tick value this thread writes
+*
+* Thread details:
+*   - Name: "SNTY" (4 chars max for Paradigm RTOS)
+*   - Priority: 30
+*   - Stack: 2KB
+*   - Cycle: 2000ms
+*******************************************************************************/
+
+#include "snmp_tiny.h"
+#include "snmp_mib.h"
+#include <stdio.h>
+#include <string.h>
+#include <ApiOS.h>
+#include <ApiThrd.h>
+#include <GloStore.h>
+#include <myapp.h>
+
+/* Periodic cycle time and buffer sizes */
+#define SNMP_TINY_CYCLE_MS  2000     /* Sleep time between updates (ms) */
+#define SNMP_TICK_BUF_SIZE  32       /* Enough for decimal UINT */
+
+/* OIDs managed by this module */
+static const CHAR* OID_DEMO = "1.3.6.1.3.2026.1.0";     /* Static demo value */
+static const CHAR* OID_TICK = "1.3.6.1.3.2026.1.1.0";   /* Incrementing tick */
+
+/* Standard SNMPv2-MIB OIDs (iso.org.dod.internet.mgmt.mib-2.system) */
+static const CHAR* OID_SYS_DESCR    = "1.3.6.1.2.1.1.1.0";   /* sysDescr    */
+static const CHAR* OID_SYS_NAME     = "1.3.6.1.2.1.1.5.0";   /* sysName     */
+static const CHAR* OID_SYS_LOCATION = "1.3.6.1.2.1.1.6.0";   /* sysLocation */
+
+/* Shared context for Tiny worker + UDP listener */
+static SNMP_TINY_CTX gSnmpCtx;
+
+
+/******************************************************************************
+* Stop flag handling
+*
+* The stop flag is shared between both SNMP threads (SNTY + SNMP).
+* When SNMP_Tiny_Done() sets it to TRUE, both threads exit their loops.
+*******************************************************************************/
+VOID SNMP_Tiny_SetStopflag(BOOL bStopFlag)
+{
+    gSnmpCtx.bStopFlag = bStopFlag;
+}
+
+BOOL SNMP_Tiny_GetStopflag(VOID)
+{
+    return gSnmpCtx.bStopFlag;
+}
+
+/* Called from MyApp.c after the UDP thread is created,
+   so we can track the thread handle for shutdown */
+VOID SNMP_Tiny_SetUdpThread(P_API_THREAD udpThreadPtr)
+{
+    gSnmpCtx.udpThreadPtr = udpThreadPtr;
+}
+
+
+/******************************************************************************
+* Convert unsigned integer to decimal string.
+*
+* Why not use sprintf?
+*   The Paradigm RTOS toolchain redefines sprintf/strncpy as macros
+*   that conflict with our build. This function avoids that problem.
+*
+* How it works:
+*   1. Extract digits from right to left into tmp[]
+*   2. Reverse them into the output buffer
+*
+* Returns: number of characters written (excluding null terminator)
+*******************************************************************************/
+static INT SNMP_UintToStr(UINT val, CHAR *buf, INT bufSize)
+{
+    CHAR   tmp[12]; /* max 10 digits for UINT32 + null */
+    INT    i = 0;
+    INT    j = 0;
+
+    if (bufSize <= 0)
+        return 0;
+
+    if (val == 0)
+    {
+        buf[0] = '0';
+        buf[1] = '\0';
+        return 1;
+    }
+
+    /* Extract digits right-to-left */
+    while (val > 0 && i < (INT)sizeof(tmp) - 1)
+    {
+        tmp[i++] = (CHAR)('0' + (val % 10));
+        val /= 10;
+    }
+
+    /* Reverse into output buffer */
+    while (i > 0 && j < bufSize - 1)
+    {
+        buf[j++] = tmp[--i];
+    }
+    buf[j] = '\0';
+    return j;
+}
+
+
+/******************************************************************************
+* SNMP_SafeStrAppend
+*
+* Appends src string to dst at position *pPos, respecting dstSize limit.
+* Updates *pPos to the new write position after appending.
+* Always keeps dst null-terminated.
+*
+* Why not use strcat/strncat?
+*   Paradigm RTOS redefines string functions as macros that conflict
+*   with our build. This function avoids that problem.
+*******************************************************************************/
+static VOID SNMP_SafeStrAppend(CHAR* dst, INT dstSize, INT* pPos, const CHAR* src)
+{
+    INT p = *pPos;
+    INT i = 0;
+
+    while (src[i] != '\0' && p < dstSize - 1)
+    {
+        dst[p++] = src[i++];
+    }
+    dst[p] = '\0';
+    *pPos = p;
+}
+
+
+/******************************************************************************
+* SNMP_Tiny_RegisterSystemOIDs
+*
+* Registers the standard SNMPv2-MIB system OIDs so that an SNMP manager
+* (e.g. iReasoning) can read them:
+*
+*   sysDescr    (1.3.6.1.2.1.1.1.0)  - "Beumer autover system"
+*   sysName     (1.3.6.1.2.1.1.5.0)  - "autoca xxx" (xxx = autoca number)
+*   sysLocation (1.3.6.1.2.1.1.6.0)  - "Beckum"
+*
+* Called from SNMP_Tiny_Init() after MIB is ready.
+* Uses GloStore_GetAutoNbr() for the autoca number in sysName.
+*******************************************************************************/
+static VOID SNMP_Tiny_RegisterSystemOIDs(VOID)
+{
+    CHAR szSysName[32];
+    CHAR szAutoNbr[16];
+    INT  pos = 0;
+
+    memset(szSysName, 0, sizeof(szSysName));
+    memset(szAutoNbr, 0, sizeof(szAutoNbr));
+
+    /* sysDescr: fixed system description */
+    SNMP_MIB_AddOrUpdate(OID_SYS_DESCR, "Beumer autover system");
+
+    /* sysName: "autoca xxx" where xxx is the autoca number */
+    SNMP_UintToStr((UINT)GloStore_GetAutoNbr(), szAutoNbr, sizeof(szAutoNbr));
+    SNMP_SafeStrAppend(szSysName, sizeof(szSysName), &pos, "autoca ");
+    SNMP_SafeStrAppend(szSysName, sizeof(szSysName), &pos, szAutoNbr);
+    SNMP_MIB_AddOrUpdate(OID_SYS_NAME, szSysName);
+
+    /* sysLocation: installation site */
+    SNMP_MIB_AddOrUpdate(OID_SYS_LOCATION, "Beckum");
+
+    printf("[SNMP] Registered sysDescr=%s sysName=%s sysLocation=%s\n",
+        "Beumer autover system", szSysName, "Beckum");
+}
+
+
+/******************************************************************************
+* SNMP Tiny Worker Thread
+*
+* This is the main heartbeat loop. Every 2 seconds it:
+*   1. Sleeps (gives CPU to other tasks)
+*   2. Prints "Hello World" to telnet (for debugging)
+*   3. Increments tick counter
+*   4. Writes tick to MIB so SNMP manager can read it
+*
+* The loop exits when the stop flag is set by SNMP_Tiny_Done().
+*
+* Note: buf is static to keep it off the 2KB thread stack.
+* Note: ApiThrd_Cleanup is NOT called here — the wrapper handles it.
+*******************************************************************************/
+UINT SNMP_Tiny_Thread(VOID)
+{
+    UINT tick = 0;
+    static CHAR buf[SNMP_TICK_BUF_SIZE];   /* static: off the stack */
+
+    while (!gSnmpCtx.bStopFlag)
+    {
+        ApiOS_Sleep(SNMP_TINY_CYCLE_MS);
+
+        printf("[SNMP] Hello World\n");
+
+       ++tick;
+       memset(buf, 0, sizeof(buf));
+        SNMP_UintToStr(tick, buf, sizeof(buf));  /* portable: no sprintf macro */
+
+        SNMP_MIB_AddOrUpdate(OID_TICK, buf);
+
+        /* If UDP thread exists, nothing to do here (RTOS cannot restart threads) */
+    }
+
+    printf("[SNMP] Tiny worker stopped.\n");
+    
+    return 0;
+}
+
+/******************************************************************************
+* Thread wrapper
+*
+* Why this exists:
+*   - Paradigm RTOS requires thread entry point to be VOID(VOID)
+*   - SNMP_Tiny_Thread returns UINT (so it can also be called as a function)
+*   - This wrapper bridges the two signatures
+*   - ApiThrd_Cleanup is called ONLY here (not in the thread function)
+*
+* This is NOT a separate thread — it IS the thread entry point.
+* The RTOS calls this function when thread "SNTY" starts.
+*******************************************************************************/
+static VOID SNMP_Tiny_Thread_Wrapper(VOID)
+{
+    SNMP_Tiny_Thread();
+    ApiThrd_Cleanup();
+}
+
+/******************************************************************************
+* SNMP_Tiny_Init
+*
+* Called once from MyApp_InitSNMP() during autoca boot.
+*
+* Steps:
+*   1. Clear shared context (stop flag, thread handles)
+*   2. Initialize the MIB (OID/value table)
+*   3. Add a demo OID with a test value
+*   4. Register standard SNMPv2-MIB system OIDs (sysDescr, sysName, sysLocation)
+*   5. Create the heartbeat thread "SNTY"
+*
+* Error handling:
+*   - Returns TRUE on success, FALSE if thread could not start
+*   - MyApp.c stores result in sSnmpRc (NOT App.sFault)
+*   - So SNMP failure never stops the autoca
+*
+* Thread name is "SNTY" (4 chars) — Paradigm RTOS limit.
+* No cast needed — wrapper already matches VOID(VOID).
+*******************************************************************************/
+BOOL SNMP_Tiny_Init(VOID)
+{
+    SHORT rc;   /* declared at top of block for C89 compatibility */
+
+    memset(&gSnmpCtx, 0, sizeof(gSnmpCtx));
+    gSnmpCtx.bStopFlag = FALSE;
+
+    SNMP_MIB_Init();
+    SNMP_MIB_AddOrUpdate(OID_DEMO, "SNMP_Tiny demo");
+
+    /* Register standard SNMPv2-MIB system OIDs */
+    SNMP_Tiny_RegisterSystemOIDs();
+
+    /* Start worker thread — Priority 30, stack 2KB */
+    rc = ApiThrd_Create(
+        &gSnmpCtx.tinyThreadPtr,
+        SNMP_Tiny_Thread_Wrapper,   /* wrapper is already VOID(VOID), no cast needed */
+        30, 2000, "SNTY"           
+    );
+
+    if (rc != 0)
+    {
+        gSnmpCtx.tinyThreadPtr = NULL;
+        printf("[SNMP] ERROR: Tiny thread could not start\n");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+/******************************************************************************
+* SNMP_Tiny_Done
+*
+* Called from _MyApp() during autoca shutdown.
+* This is the FIRST cleanup step in _MyApp — before other EndTask calls.
+*
+* Steps:
+*   1. Set stop flag ? both SNMP threads (SNTY + SNMP) exit their loops
+*   2. Wait 2500ms (longer than the 2000ms thread cycle) so threads finish
+*   3. Clear MIB table (free all OID entries)
+*
+* Safe to call even if SNMP was never started — memset in Init zeroed
+* everything, so bStopFlag and MIB are in a safe state.
+*******************************************************************************/
+VOID SNMP_Tiny_Done(VOID)
+{
+    gSnmpCtx.bStopFlag = TRUE;
+    ApiOS_Sleep(2500);   /* wait longer than the thread cycle (2000ms) */
+    SNMP_MIB_Done();
+}
+
+
+/******************************************************************************
+* Compatibility stubs (legacy)
+*
+* These exist so old code that calls SNMP_Tiny() or _SNMP_Tiny()
+* doesn't break. They do nothing useful.
+*******************************************************************************/
+VOID SNMP_Tiny(void) { printf("SNMP_Tiny() called\n"); }
+VOID _SNMP_Tiny(void) { printf("_SNMP_Tiny() internal call\n"); }
+
+
+
+
+
+
+
+
+#pragma once
+/******************************************************************************
+* snmp_mib.h
+*
+* Minimal SNMP MIB (Management Information Base) interface.
+*
+* The MIB is implemented as a fixed-size table mapping:
+*       OID string  ->  value string
+*
+* No dynamic memory is used, and the module is not thread?safe.
+*******************************************************************************/
+
+#ifndef __SNMP_MIB_H__
+#define __SNMP_MIB_H__
+
+#include <ApiOS.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+    /* Maximum lengths for OID and its stored value */
+#define MIB_OID_MAX_LEN    128     /* e.g. "1.3.6.1.3.2026.1.0" */
+#define MIB_VALUE_MAX_LEN  256     /* e.g. "42" or "HelloSNMP"  */
+
+
+/******************************************************************************
+* SNMP_MIB_ENTRY
+*
+* Represents a single row in the MIB table:
+*   - oid   : OID text
+*   - value : value associated with the OID
+*******************************************************************************/
+    typedef struct _SNMP_MIB_ENTRY
+    {
+        char oid[MIB_OID_MAX_LEN];
+        char value[MIB_VALUE_MAX_LEN];
+    } SNMP_MIB_ENTRY;
+
+
+    /******************************************************************************
+    * Lifecycle
+    *******************************************************************************/
+
+    /* Initialize the table (clears all entries, marks module as ready) */
+    BOOL SNMP_MIB_Init(VOID);
+
+    /* Shutdown: clears entries and disables access */
+    VOID SNMP_MIB_Done(VOID);
+
+
+    /******************************************************************************
+    * MIB Operations
+    *******************************************************************************/
+
+    /* Add a new OID or update it if it exists */
+    BOOL SNMP_MIB_AddOrUpdate(const char* oid, const char* value);
+
+    /* Retrieve a value into caller buffer (returns FALSE if not found) */
+    BOOL SNMP_MIB_Get(const char* oid, char* out, INT out_len);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __SNMP_MIB_H__ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+* snmp_mib.c
+*
+* Minimal SNMP MIB (Management Information Base) implementation.
+*
+* What this file does:
+*   - Stores OID/value pairs in a simple table (like a small database)
+*   - Example: OID "1.3.6.1.3.2026.1.1.0" ? value "42" (tick counter)
+*   - Supports Add, Update, and Get operations
+*   - Maximum 32 OID entries (no dynamic memory, safe for RTOS)
+*
+* How it fits in the system:
+*   - snmp_tiny.c writes the tick counter here every 2 seconds
+*   - snmp_udp.c reads values from here when an SNMP request arrives
+*   - MyApp.c adds the initial demo OID during boot
+*   - SNMP_MIB_Done() clears the table during shutdown
+*
+* Important notes:
+*   - Not thread-safe (both threads access it, but writes are atomic
+*     enough for this use case — single writer, single reader)
+*   - Uses SNMP_SafeStrCopy instead of strncpy_s because
+*     Paradigm RTOS does not support strncpy_s
+*   - No dynamic memory (malloc/free) — everything is static
+*******************************************************************************/
+
+#include "snmp_mib.h"
+#include <string.h>
+
+/* Maximum number of OID entries allowed */
+#define MAX_OIDS  32
+
+/* Internal MIB storage */
+static SNMP_MIB_ENTRY g_Mib[MAX_OIDS];   /* Table of OID entries          */
+static INT            g_Count = 0;       /* Number of active entries      */
+static BOOL           g_bReady = FALSE;  /* TRUE once Init() has been run */
+
+
+/******************************************************************************
+* SNMP_SafeStrCopy
+*
+* Portable bounded string copy.
+*
+* Why not use strncpy_s?
+*   strncpy_s with _TRUNCATE is MSVC-only. Paradigm RTOS doesn't have it.
+*   This function works on both platforms.
+*
+* Always null-terminates the destination buffer.
+* bufSize must be > 0.
+*******************************************************************************/
+static VOID SNMP_SafeStrCopy(CHAR *dst, INT dstSize, const CHAR *src)
+{
+    INT i = 0;
+    while (i < dstSize - 1 && src[i] != '\0')
+    {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+
+/******************************************************************************
+* SNMP_MIB_Init
+*
+* Called from SNMP_Tiny_Init() during boot.
+* Resets the entry count and marks the module as ready for use.
+*******************************************************************************/
+BOOL SNMP_MIB_Init(void)
+{
+    g_Count  = 0;
+    g_bReady = TRUE;
+    return TRUE;
+}
+
+
+/******************************************************************************
+* SNMP_MIB_Done
+*
+* Called from SNMP_Tiny_Done() during shutdown.
+* Clears the table and blocks further access until Init() is called again.
+*******************************************************************************/
+VOID SNMP_MIB_Done(void)
+{
+    g_Count  = 0;
+    g_bReady = FALSE;
+}
+
+
+/******************************************************************************
+* SNMP_MIB_AddOrUpdate
+*
+* If the OID already exists ? update its value.
+* If the OID is new ? add it to the end of the table.
+*
+* Error handling:
+*   - Returns FALSE if module not initialized
+*   - Returns FALSE if oid or value is NULL
+*   - Returns FALSE if table is full (32 entries max)
+*
+* Called from:
+*   - SNMP_Tiny_Init()   ? adds demo OID
+*   - MyApp_InitSNMP()   ? adds "HelloSNMP" OID
+*   - SNMP_Tiny_Thread() ? updates tick counter every 2s
+*******************************************************************************/
+BOOL SNMP_MIB_AddOrUpdate(const char* oid, const char* value)
+{
+    INT i;  /* declared at top of block for C89 compatibility */
+
+    if (!g_bReady || !oid || !value)
+        return FALSE;
+
+    /* Look for an existing entry with same OID */
+    for (i = 0; i < g_Count; i++)
+    {
+        if (strcmp(g_Mib[i].oid, oid) == 0)
+        {
+            /* Found — update existing value */
+            SNMP_SafeStrCopy(g_Mib[i].value, sizeof(g_Mib[i].value), value);
+            return TRUE;
+        }
+    }
+
+    /* Not found — check if table is full */
+    if (g_Count >= MAX_OIDS)
+        return FALSE;
+
+    /* Add new entry at end of table */
+    SNMP_SafeStrCopy(g_Mib[g_Count].oid,   sizeof(g_Mib[g_Count].oid),   oid);
+    SNMP_SafeStrCopy(g_Mib[g_Count].value, sizeof(g_Mib[g_Count].value), value);
+    g_Count++;
+
+    return TRUE;
+}
+
+
+/******************************************************************************
+* SNMP_MIB_Get
+*
+* Looks up an OID and copies its value into the caller's buffer.
+*
+* Returns TRUE if found, FALSE if not found or invalid parameters.
+*
+* Called from:
+*   - SNMP_UDP_Thread() ? when an SNMP GET request arrives
+*******************************************************************************/
+BOOL SNMP_MIB_Get(const char* oid, char* out, INT out_len)
+{
+    INT i;  /* declared at top of block for C89 compatibility */
+
+    if (!g_bReady || !oid || !out || out_len <= 0)
+        return FALSE;
+
+    for (i = 0; i < g_Count; i++)
+    {
+        if (strcmp(g_Mib[i].oid, oid) == 0)
+        {
+            SNMP_SafeStrCopy(out, out_len, g_Mib[i].value);
+            return TRUE;
+        }
+    }
+
+    return FALSE; /* OID not found */
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+* snmp_udp.c
+*
+* UDP listener thread for SNMP.
+*
+* What this file does:
+*   - Runs as thread "SNMP" on UDP port 161 (standard SNMP port)
+*   - Waits for incoming SNMP GET requests from a manager (e.g. iReasoning)
+*   - Extracts the requested OID from the packet
+*   - Looks up the OID value in the MIB
+*   - Builds an SNMPv1 GET-RESPONSE packet and sends it back
+*   - Returns noSuchName error for unknown OIDs
+*   - Handles sysUpTime (1.3.6.1.2.1.1.3.0) with TimeTicks encoding
+*
+* How it fits in the system:
+*   - Thread is created in MyApp_InitSNMP() (MyApp.c)
+*   - Uses stop flag from snmp_tiny.c to know when to exit
+*   - Reads values from snmp_mib.c
+*   - Uses snmp_v1.c to encode/decode SNMP packets
+*
+* Thread details:
+*   - Name: "SNMP" (4 chars max for Paradigm RTOS)
+*   - Priority: 30
+*   - Stack: 2KB (buffers are static, not on stack)
+*   - Timeout: 2000ms per receive cycle
+*
+* Important: All large buffers (recvBuf, sendBuf, value, reqOid) are declared
+*   static to avoid stack overflow on the 2KB thread stack.
+*******************************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ApiOS.h>
+#include <ApiSock.h>
+#include <ApiThrd.h>
+
+#include "snmp_mib.h"
+#include "snmp_v1.h"
+#include "snmp_tiny.h"
+
+/* Configuration */
+#define SNMP_PORT_UDP         161      /* SNMP standard port  */
+#define SNMP_RECV_TIMEOUT_MS  2000     /* Wait timeout (ms)    */
+#define SNMP_BUF_SIZE         1024     /* Incoming/outgoing SNMP buffer size */
+#define SNMP_VAL_SIZE         256      /* Buffer for MIB value */
+#define SNMP_OID_SIZE         128      /* Buffer for extracted OID string */
+
+/* sysUpTime OID — handled specially (TimeTicks, not string) */
+static const CHAR* OID_SYS_UPTIME = "1.3.6.1.2.1.1.3.0";
+
+/* Boot timestamp — captured once when thread starts */
+static ULONG gulSnmpBootTick = 0;
+
+
+/******************************************************************************
+* Thread wrapper
+*
+* Same pattern as snmp_tiny.c:
+*   - RTOS needs VOID(VOID), but SNMP_UDP_Thread returns UINT
+*   - Wrapper bridges the signature and calls ApiThrd_Cleanup
+*   - This is NOT an extra thread — it IS the thread entry point
+*******************************************************************************/
+VOID SNMP_UDP_Thread_Wrapper(VOID)
+{
+    SNMP_UDP_Thread();
+    ApiThrd_Cleanup();
+}
+
+
+/******************************************************************************
+* SNMP_UDP_Thread
+*
+* Main UDP listener loop.
+*
+* Startup:
+*   1. Open UDP socket
+*   2. Bind to port 161
+*   3. Capture boot tick for sysUpTime calculation
+*   4. Enter receive loop
+*
+* Each cycle:
+*   1. Wait up to 2 seconds for a packet
+*   2. If nothing received, loop back (check stop flag)
+*   3. If packet received, extract OID from the GET request
+*   4. If OID is sysUpTime: build TimeTicks response
+*   5. Else look up OID value in MIB
+*   6. If found: build GET-RESPONSE with the value
+*   7. If not found: build GET-RESPONSE with noSuchName error
+*   8. Send response back to the requester
+*
+* Shutdown:
+*   - Loop exits when SNMP_Tiny_GetStopflag() returns TRUE
+*   - Socket is closed before returning
+*
+* Error handling:
+*   - If socket open fails, returns 1 (logged by MyApp_InitSNMP)
+*   - If bind fails, closes socket and returns 1
+*   - If OID extraction fails, packet is silently dropped
+*   - If MIB lookup fails, noSuchName error response is sent
+*
+* Platform note:
+*   - ApiSock_Bind has different signatures on WIN32 vs Paradigm
+*   - WIN32: ApiSock_Bind(&sock, port, flags)
+*   - Paradigm: ApiSock_Bind(&sock, port)
+*******************************************************************************/
+UINT SNMP_UDP_Thread(VOID)
+{
+    API_SOCKET sock;
+    SHORT      rc;
+    SHORT      recvLen;
+    static UCHAR recvBuf[SNMP_BUF_SIZE];   /* static: off the stack */
+    static UCHAR sendBuf[SNMP_BUF_SIZE];   /* static: off the stack */
+    static CHAR  value[SNMP_VAL_SIZE];      /* static: off the stack */
+    static CHAR  reqOid[SNMP_OID_SIZE];     /* static: off the stack */
+    INT        outLen;
+    ULONG      fromIP   = 0;
+    USHORT     fromPort = 0;
+
+    /* Capture boot time for sysUpTime calculation */
+    gulSnmpBootTick = ApiOS_GetTickCount();
+
+    /* Open UDP socket */
+    rc = ApiSock_Open(&sock);
+    if (rc < 0)
+    {
+        printf("[SNMP] ApiSock_Open failed\n");
+        return 1;
+    }
+
+    /* Bind to SNMP port on all interfaces */
+#if defined(_WIN32) || defined(_WIN64)
+    /* Windows/Visual Studio build: use 3 arguments */
+    rc = ApiSock_Bind(&sock, SNMP_PORT_UDP, 0);
+#else
+    /* Paradigm RTOS build: use 2 arguments */
+    rc = ApiSock_Bind(&sock, SNMP_PORT_UDP);
+#endif
+    if (rc < 0)
+    {
+        printf("[SNMP] ApiSock_Bind failed\n");
+        ApiSock_Close(&sock);
+        return 1;
+    }
+
+    printf("[SNMP] UDP listener active on port %d\n", SNMP_PORT_UDP);
+
+    /* Listener loop — runs until stop flag is set */
+    while (!SNMP_Tiny_GetStopflag())
+    {
+        /* Wait for incoming SNMP packet (2s timeout) */
+        recvLen = ApiSock_recvfrom(
+            &sock,
+            (char*)recvBuf,
+            SNMP_BUF_SIZE,
+            SNMP_RECV_TIMEOUT_MS,
+            &fromIP,
+            &fromPort
+        );
+
+        if (recvLen <= 0)
+            continue; /* nothing received: loop back and check stop flag */
+
+        /* Extract the requested OID from the incoming GET packet */
+        memset(reqOid, 0, sizeof(reqOid));
+        if (!SNMPv1_ExtractRequestedOid(recvBuf, recvLen, reqOid, sizeof(reqOid)))
+        {
+            /* Could not parse packet — silently drop */
+            continue;
+        }
+
+        /* Special case: sysUpTime requires TimeTicks encoding (tag 0x43) */
+        if (strcmp(reqOid, OID_SYS_UPTIME) == 0)
+        {
+            /* Calculate uptime in hundredths of a second (TimeTicks unit) */
+            ULONG ulUptime = (ApiOS_GetTickCount() - gulSnmpBootTick) / 10;
+
+            outLen = SNMPv1_BuildGetResponse_Public_TimeTicks(
+                recvBuf,
+                recvLen,
+                reqOid,
+                ulUptime,
+                sendBuf,
+                sizeof(sendBuf)
+            );
+
+            if (outLen > 0)
+            {
+                ApiSock_sendto(&sock, (char*)sendBuf, outLen, fromIP, fromPort);
+                printf("[SNMP] OID %s -> TimeTicks %lu\n", reqOid, ulUptime);
+            }
+            continue;
+        }
+
+        /* Look up the requested OID in the MIB */
+        memset(value, 0, sizeof(value));
+        if (SNMP_MIB_Get(reqOid, value, sizeof(value)))
+        {
+            /* OID found — build success response */
+            outLen = SNMPv1_BuildGetResponse_Public_String(
+                recvBuf,
+                recvLen,
+                reqOid,
+                value,
+                sendBuf,
+                sizeof(sendBuf)
+            );
+
+            if (outLen > 0)
+            {
+                ApiSock_sendto(&sock, (char*)sendBuf, outLen, fromIP, fromPort);
+                printf("[SNMP] OID %s -> \"%s\"\n", reqOid, value);
+            }
+        }
+        else
+        {
+            /* OID not found — send noSuchName error */
+            outLen = SNMPv1_BuildErrorResponse_Public(
+                recvBuf,
+                recvLen,
+                sendBuf,
+                sizeof(sendBuf)
+            );
+
+            if (outLen > 0)
+            {
+                ApiSock_sendto(&sock, (char*)sendBuf, outLen, fromIP, fromPort);
+                printf("[SNMP] OID %s -> noSuchName\n", reqOid);
+            }
+        }
+    }
+
+    printf("[SNMP] UDP listener stopped.\n");
+
+    /* Clean up socket before thread exits */
+    ApiSock_Close(&sock);
+    return 0;
+}
+
+
+/******************************************************************************
+* StartSnmpUdpListener
+*
+* Legacy stub — intentionally empty.
+* Thread creation is handled in MyApp_InitSNMP() via ApiThrd_Create.
+* This function exists only so old code that calls it doesn't break.
+*******************************************************************************/
+VOID StartSnmpUdpListener(VOID)
+{
+    /* intentionally empty */
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+* snmp_v1.h
+*
+* SNMPv1 encoding/decoding helpers.
+*
+* Provides functions:
+*   1) BuildGetResponse_Public_String
+*      - Parses an incoming SNMPv1 GET request
+*      - Validates version=0, community="public", and expected OID
+*      - Builds a valid GET-RESPONSE packet containing a string value
+*
+*   2) BuildErrorResponse_Public
+*      - Builds an SNMPv1 GET-RESPONSE with error-status = noSuchName (2)
+*
+*   3) ExtractRequestedOid
+*      - Parses an incoming SNMPv1 GET request and extracts the OID string
+*
+*   4) BuildGetResponse_Public_TimeTicks
+*      - Builds a GET-RESPONSE with a TimeTicks (0x43) value
+*
+* All functions operate on raw BER/ASN.1 encoded byte buffers.
+*******************************************************************************/
+
+#ifndef __SNMP_V1_H__
+#define __SNMP_V1_H__
+
+#include <ApiOS.h>    /* Provides UCHAR, CHAR, INT, UINT via Paradigm headers */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+    /******************************************************************************
+    * SNMPv1_BuildGetResponse_Public_String
+    *
+    * Parameters:
+    *   inBuf          - raw incoming SNMP packet
+    *   inLen          - size of incoming packet
+    *   pszExpectedOid - OID string that must match the GET request
+    *   pszValue       - string value to include in the GET-RESPONSE
+    *   outBuf         - output buffer for the encoded response
+    *   outLen         - size of output buffer
+    *
+    * Returns:
+    *   >0 : number of bytes written to outBuf
+    *    0 : invalid packet or OID mismatch
+    *******************************************************************************/
+    INT SNMPv1_BuildGetResponse_Public_String(
+        const UCHAR* inBuf,
+        INT          inLen,
+        const CHAR*  pszExpectedOid,
+        const CHAR*  pszValue,
+        UCHAR*       outBuf,
+        INT          outLen);
+
+
+    /******************************************************************************
+    * SNMPv1_BuildErrorResponse_Public
+    *
+    * Builds a GET-RESPONSE with:
+    *   error-status = noSuchName (2)
+    *   error-index  = 1
+    *
+    * Used when the incoming GET request is valid but the OID is unknown.
+    *
+    * Returns:
+    *   >0 : length of encoded packet
+    *    0 : incoming packet invalid/unparsable
+    *******************************************************************************/
+    INT SNMPv1_BuildErrorResponse_Public(
+        const UCHAR* inBuf,
+        INT          inLen,
+        UCHAR*       outBuf,
+        INT          outLen);
+
+
+    /******************************************************************************
+    * SNMPv1_ExtractRequestedOid
+    *
+    * Parses an incoming SNMPv1 GET request and extracts the requested OID
+    * as a dotted-decimal string (e.g. "1.3.6.1.2.1.1.1.0").
+    *
+    * Parameters:
+    *   inBuf    - raw incoming SNMP packet
+    *   inLen    - size of incoming packet
+    *   oidBuf   - output buffer for the dotted OID string
+    *   oidBufSz - size of output buffer
+    *
+    * Returns:
+    *   TRUE  : OID extracted successfully
+    *   FALSE : packet invalid or buffer too small
+    *******************************************************************************/
+    BOOL SNMPv1_ExtractRequestedOid(
+        const UCHAR* inBuf,
+        INT          inLen,
+        CHAR*        oidBuf,
+        INT          oidBufSz);
+
+
+    /******************************************************************************
+    * SNMPv1_BuildGetResponse_Public_TimeTicks
+    *
+    * Builds a GET-RESPONSE with a TimeTicks value (BER tag 0x43).
+    * TimeTicks = hundredths of a second (UINT32).
+    *
+    * Parameters:
+    *   inBuf          - raw incoming SNMP packet
+    *   inLen          - size of incoming packet
+    *   pszExpectedOid - OID string that must match the GET request
+    *   ulTimeTicks    - value in hundredths of a second
+    *   outBuf         - output buffer for the encoded response
+    *   outBufLen      - size of output buffer
+    *
+    * Returns:
+    *   >0 : number of bytes written to outBuf
+    *    0 : invalid packet or OID mismatch
+    *******************************************************************************/
+    INT SNMPv1_BuildGetResponse_Public_TimeTicks(
+        const UCHAR* inBuf,
+        INT          inLen,
+        const CHAR*  pszExpectedOid,
+        ULONG        ulTimeTicks,
+        UCHAR*       outBuf,
+        INT          outBufLen);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __SNMP_V1_H__ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+* snmp_v1.c
+*
+* SNMPv1 encoding/decoding helpers.
+*
+* Handles raw BER (Basic Encoding Rules) parsing and encoding used in SNMP:
+*   [Tag 1 byte][Length 1?3 bytes][Value N bytes]
+*
+* Responsibilities:
+*   - Decode incoming SNMPv1 GET packets
+*   - Validate version, community, and requested OID
+*   - Encode SNMPv1 GET-RESPONSE packets (success or error)
+*******************************************************************************/
+
+#include "snmp_v1.h"
+#include <ApiOS.h>    /* Provides type definitions via Paradigm headers */
+#include <string.h>
+#include <stdlib.h>   /* strtoul - used when parsing dotted OIDs */
+
+
+/******************************************************************************
+* BER TAG CONSTANTS
+*******************************************************************************/
+#define PDU_GET             0xA0   /* incoming GET request  */
+#define PDU_GETRESP         0xA2   /* outgoing GET response */
+#define TAG_INTEGER         0x02
+#define TAG_OCTET           0x04
+#define TAG_NULL            0x05
+#define TAG_OID             0x06
+#define TAG_TIMETICKS       0x43   /* SNMP TimeTicks (Application 3) */
+#define TAG_SEQUENCE        0x30
+
+#define BER_LEN_RESERVE     3
+#define OID_ENCODE_BUF      128
+#define SNMP_COMMUNITY      "public"
+#define SNMP_COMMUNITY_LEN  6
+#define SNMP_VERSION_1      0
+#define SNMP_ERR_NOSUCHNAME 2
+#define SNMP_ERR_INDEX_1    1
+
+
+/******************************************************************************
+* BER READ HELPERS
+* Each function advances the buffer pointer while validating structure.
+*******************************************************************************/
+
+/* Reads BER length field (short or long form) */
+static const UCHAR* ber_get_len(const UCHAR* p, const UCHAR* end, UINT* len)
+{
+    if (p >= end) return 0;
+
+    if (!(*p & 0x80))
+    {
+        *len = *p++;  /* short form */
+    }
+    else
+    {
+        int n = *p++ & 0x7F; /* number of length bytes */
+        if (p + n > end) return 0;
+
+        *len = 0;
+        while (n--) *len = (*len << 8) | *p++;
+    }
+    return p;
+}
+
+/* Reads BER INTEGER */
+static const UCHAR* ber_get_integer(const UCHAR* p, const UCHAR* end, INT* val)
+{
+    UINT len;
+
+    if (p >= end || *p++ != TAG_INTEGER) return 0;
+
+    p = ber_get_len(p, end, &len);
+    if (!p || p + len > end) return 0;
+
+    *val = 0;
+
+    if (len > 0)
+    {
+        UINT i;
+        if (*p & 0x80) *val = -1; /* sign extend */
+        for (i = 0; i < len; i++)
+            *val = (*val << 8) | *p++;
+    }
+
+    return p;
+}
+
+/* Reads BER OCTET STRING */
+static const UCHAR* ber_get_octets(const UCHAR* p, const UCHAR* end,
+    const UCHAR** out, UINT* outLen)
+{
+    if (p >= end || *p++ != TAG_OCTET) return 0;
+
+    p = ber_get_len(p, end, outLen);
+    if (!p || p + *outLen > end) return 0;
+
+    *out = p;
+    return p + *outLen;
+}
+
+/* Reads raw bytes of BER OID tag */
+static const UCHAR* ber_get_oid_val_ptr(const UCHAR* p, const UCHAR* end,
+    const UCHAR** out, UINT* outLen)
+{
+    if (p >= end || *p++ != TAG_OID) return 0;
+
+    p = ber_get_len(p, end, outLen);
+    if (!p || p + *outLen > end) return 0;
+
+    *out = p;
+    return p + *outLen;
+}
+
+
+/******************************************************************************
+* BER WRITE HELPERS
+*******************************************************************************/
+
+/* Writes long-form length field */
+static UCHAR* ber_put_len(UCHAR* p, UINT len)
+{
+    *p++ = 0x82;
+    *p++ = (UCHAR)((len >> 8) & 0xFF);
+    *p++ = (UCHAR)(len & 0xFF);
+    return p;
+}
+
+/* Writes BER INTEGER */
+static UCHAR* ber_put_int(UCHAR* p, INT val)
+{
+    UCHAR buf[4];
+    int   s = 0;
+
+    *p++ = TAG_INTEGER;
+
+    if (val == 0)
+    {
+        *p++ = 1;
+        *p++ = 0;
+        return p;
+    }
+
+    buf[0] = (UCHAR)((val >> 24) & 0xFF);
+    buf[1] = (UCHAR)((val >> 16) & 0xFF);
+    buf[2] = (UCHAR)((val >> 8)  & 0xFF);
+    buf[3] = (UCHAR)(val & 0xFF);
+
+    while (s < 3 && buf[s] == 0 && !(buf[s + 1] & 0x80)) s++;
+
+    *p++ = (UCHAR)(4 - s);
+    while (s < 4) *p++ = buf[s++];
+
+    return p;
+}
+
+/* Writes BER OCTET STRING */
+static UCHAR* ber_put_octets(UCHAR* p, const UCHAR* s, UINT len)
+{
+    *p++ = TAG_OCTET;
+
+    if (len < 128) *p++ = (UCHAR)len;
+    else { *p++ = 0x81; *p++ = (UCHAR)len; }
+
+    memcpy(p, s, len);
+    return p + len;
+}
+
+/* Writes BER TimeTicks (tag 0x43, unsigned 32-bit) */
+static UCHAR* ber_put_timeticks(UCHAR* p, ULONG val)
+{
+    UCHAR buf[4];
+    int   s = 0;
+
+    *p++ = TAG_TIMETICKS;
+
+    buf[0] = (UCHAR)((val >> 24) & 0xFF);
+    buf[1] = (UCHAR)((val >> 16) & 0xFF);
+    buf[2] = (UCHAR)((val >> 8)  & 0xFF);
+    buf[3] = (UCHAR)(val & 0xFF);
+
+    /* Skip leading zero bytes, but keep at least 1 byte */
+    /* Add extra byte if high bit set (unsigned requires leading 0x00) */
+    if (buf[0] & 0x80)
+    {
+        /* Need 5 bytes: leading 0x00 + 4 data bytes */
+        *p++ = 5;
+        *p++ = 0x00;
+        *p++ = buf[0]; *p++ = buf[1]; *p++ = buf[2]; *p++ = buf[3];
+    }
+    else
+    {
+        while (s < 3 && buf[s] == 0 && !(buf[s + 1] & 0x80)) s++;
+        *p++ = (UCHAR)(4 - s);
+        while (s < 4) *p++ = buf[s++];
+    }
+
+    return p;
+}
+
+/* Encodes dotted OID string to BER bytes */
+static UCHAR* ber_put_oid(UCHAR* q, const CHAR* oidStr)
+{
+    UCHAR         tmp[OID_ENCODE_BUF];
+    UINT          tLen = 0;
+    const CHAR*   c    = oidStr;
+    unsigned long n1;
+    unsigned long n2;
+
+    n1 = strtoul(c, (char**)&c, 10); if (*c == '.') c++;
+    n2 = strtoul(c, (char**)&c, 10); if (*c == '.') c++;
+
+    tmp[tLen++] = (UCHAR)(n1 * 40 + n2);
+
+    while (*c)
+    {
+        unsigned long n = strtoul(c, (char**)&c, 10);
+        if (*c == '.') c++;
+
+        if (n < 128)
+        {
+            tmp[tLen++] = (UCHAR)n;
+        }
+        else
+        {
+            UCHAR stack[8];
+            int   cnt = 0;
+            stack[cnt++] = (UCHAR)(n & 0x7F); n >>= 7;
+
+            while (n)
+            {
+                stack[cnt++] = (UCHAR)((n & 0x7F) | 0x80);
+                n >>= 7;
+            }
+
+            while (cnt) tmp[tLen++] = stack[--cnt];
+        }
+    }
+
+    *q++ = TAG_OID;
+    *q++ = (UCHAR)tLen;
+    memcpy(q, tmp, tLen);
+    return q + tLen;
+}
+
+/* Compare incoming OID to expected one */
+static int ber_oid_equals(const UCHAR* oidPtr, UINT oidLen, const CHAR* expected)
+{
+    UCHAR  tmp[OID_ENCODE_BUF];
+    UCHAR* t      = ber_put_oid(tmp, expected);
+    UINT   encLen = (UINT)(t - tmp - 2);
+
+    if (encLen != oidLen) return 0;
+
+    return memcmp(oidPtr, tmp + 2, oidLen) == 0;
+}
+
+
+/******************************************************************************
+* Decode BER-encoded OID bytes into a dotted-decimal string.
+*
+* BER OID encoding:
+*   - First byte encodes sub-IDs 0 and 1 as: (id0 * 40) + id1
+*   - Subsequent bytes use base-128 encoding (high bit = continuation)
+*
+* Example: bytes [2B 06 01 02 01 01 01 00] -> "1.3.6.1.2.1.1.1.0"
+*
+* Uses SNMP_UlongToStr helper to avoid sprintf (Paradigm conflict).
+*******************************************************************************/
+
+/* Convert unsigned long to decimal string, return length written */
+static INT SNMP_UlongToStr(unsigned long val, CHAR* buf, INT bufSize)
+{
+    CHAR tmp[12];
+    INT  i = 0;
+    INT  j = 0;
+
+    if (bufSize <= 0)
+        return 0;
+
+    if (val == 0)
+    {
+        buf[0] = '0';
+        return 1;
+    }
+
+    while (val > 0 && i < (INT)sizeof(tmp) - 1)
+    {
+        tmp[i++] = (CHAR)('0' + (val % 10));
+        val /= 10;
+    }
+
+    while (i > 0 && j < bufSize - 1)
+    {
+        buf[j++] = tmp[--i];
+    }
+    return j;
+}
+
+static BOOL ber_decode_oid_to_string(const UCHAR* oidBytes, UINT oidLen,
+    CHAR* outBuf, INT outBufSz)
+{
+    UINT          i   = 0;
+    INT           pos = 0;
+    unsigned long sub;
+    INT           n;
+
+    if (!oidBytes || oidLen == 0 || !outBuf || outBufSz <= 0)
+        return FALSE;
+
+    /* First byte: id0 = byte / 40, id1 = byte % 40 */
+    n = SNMP_UlongToStr((unsigned long)(oidBytes[0] / 40), outBuf + pos, outBufSz - pos);
+    pos += n;
+    if (pos >= outBufSz - 1) { outBuf[outBufSz - 1] = '\0'; return FALSE; }
+
+    outBuf[pos++] = '.';
+
+    n = SNMP_UlongToStr((unsigned long)(oidBytes[0] % 40), outBuf + pos, outBufSz - pos);
+    pos += n;
+
+    i = 1;
+    while (i < oidLen)
+    {
+        /* Decode base-128 sub-identifier */
+        sub = 0;
+        while (i < oidLen)
+        {
+            sub = (sub << 7) | (oidBytes[i] & 0x7F);
+            if (!(oidBytes[i] & 0x80))
+            {
+                i++;
+                break;
+            }
+            i++;
+        }
+
+        if (pos >= outBufSz - 1) { outBuf[outBufSz - 1] = '\0'; return FALSE; }
+        outBuf[pos++] = '.';
+
+        n = SNMP_UlongToStr(sub, outBuf + pos, outBufSz - pos);
+        pos += n;
+    }
+
+    if (pos < outBufSz)
+        outBuf[pos] = '\0';
+    else
+        outBuf[outBufSz - 1] = '\0';
+
+    return TRUE;
+}
+
+
+/******************************************************************************
+* SNMPv1_BuildGetResponse_Public_String
+*******************************************************************************/
+INT SNMPv1_BuildGetResponse_Public_String(
+    const UCHAR* inBuf, INT inLen,
+    const CHAR* pszExpectedOid, const CHAR* pszValue,
+    UCHAR* outBuf, INT outLen)
+{
+    const UCHAR* p      = inBuf;
+    const UCHAR* end    = inBuf + inLen;
+    const UCHAR* msgEnd;
+    const UCHAR* pduEnd;
+    const UCHAR* vblEnd;
+    const UCHAR* vbEnd;
+    const UCHAR* comm;
+    const UCHAR* oidPtr;
+    UINT         msgLen;
+    UINT         pduLen;
+    UINT         vblLen;
+    UINT         vbLen;
+    UINT         commLen;
+    UINT         oidLen;
+    UINT         nullLen;
+    INT          version;
+    INT          reqId;
+    INT          errStat;
+    INT          errIdx;
+    UCHAR*       q;
+    UCHAR*       start;
+    UCHAR*       msgLenPos;
+    UCHAR*       pduLenPos;
+    UCHAR*       vblLenPos;
+    UCHAR*       vbLenPos;
+
+    /* Expect outer SEQUENCE */
+    if (p >= end || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, end, &msgLen);
+    if (!p || p + msgLen > end) return 0;
+    msgEnd = p + msgLen;
+
+    /* Version = SNMPv1 */
+    p = ber_get_integer(p, msgEnd, &version);
+    if (!p || version != SNMP_VERSION_1) return 0;
+
+    /* Community ("public") */
+    p = ber_get_octets(p, msgEnd, &comm, &commLen);
+    if (!p || commLen != SNMP_COMMUNITY_LEN ||
+        memcmp(comm, SNMP_COMMUNITY, SNMP_COMMUNITY_LEN) != 0) return 0;
+
+    /* PDU type GET */
+    if (p >= msgEnd || *p++ != PDU_GET) return 0;
+
+    p = ber_get_len(p, msgEnd, &pduLen);
+    if (!p || p + pduLen > msgEnd) return 0;
+    pduEnd = p + pduLen;
+
+    /* request-id, error-status, error-index */
+    p = ber_get_integer(p, pduEnd, &reqId);
+    p = ber_get_integer(p, pduEnd, &errStat);
+    p = ber_get_integer(p, pduEnd, &errIdx);
+    if (!p) return 0;
+
+    /* VarBindList SEQUENCE */
+    if (p >= pduEnd || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, pduEnd, &vblLen);
+    if (!p || p + vblLen > pduEnd) return 0;
+    vblEnd = p + vblLen;
+
+    /* VarBind SEQUENCE */
+    if (p >= vblEnd || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, vblEnd, &vbLen);
+    if (!p || p + vbLen > vblEnd) return 0;
+    vbEnd = p + vbLen;
+
+    /* Extract OID */
+    p = ber_get_oid_val_ptr(p, vbEnd, &oidPtr, &oidLen);
+    if (!p) return 0;
+
+    /* GET request always carries NULL as the value */
+    if (p >= vbEnd || *p++ != TAG_NULL) return 0;
+    p = ber_get_len(p, vbEnd, &nullLen);
+    if (!p || nullLen != 0) return 0;
+
+    /* Check OID match */
+    if (!ber_oid_equals(oidPtr, oidLen, pszExpectedOid)) return 0;
+
+    /*******************************
+     * Build the GET-RESPONSE PDU
+     *******************************/
+    q     = outBuf;
+    start = q;
+
+    *q++ = TAG_SEQUENCE;
+    msgLenPos = q; q += BER_LEN_RESERVE;
+
+    q = ber_put_int(q, SNMP_VERSION_1);
+    q = ber_put_octets(q, (const UCHAR*)SNMP_COMMUNITY, SNMP_COMMUNITY_LEN);
+
+    *q++ = PDU_GETRESP;
+    pduLenPos = q; q += BER_LEN_RESERVE;
+
+    q = ber_put_int(q, reqId);
+    q = ber_put_int(q, 0);
+    q = ber_put_int(q, 0);
+
+    *q++ = TAG_SEQUENCE;
+    vblLenPos = q; q += BER_LEN_RESERVE;
+
+    *q++ = TAG_SEQUENCE;
+    vbLenPos = q; q += BER_LEN_RESERVE;
+
+    /* Write encoded OID */
+    {
+        UCHAR  tmp[OID_ENCODE_BUF];
+        UCHAR* t   = ber_put_oid(tmp, pszExpectedOid);
+        UINT   len = (UINT)(t - tmp);
+        memcpy(q, tmp, len);
+        q += len;
+    }
+
+    /* Write returned value */
+    {
+        UINT vlen = 0;
+        while (pszValue[vlen] != '\0' && (INT)vlen < outLen)
+            vlen++;
+        q = ber_put_octets(q, (const UCHAR*)pszValue, vlen);
+    }
+
+    /* Patch all reserved lengths */
+    ber_put_len(vbLenPos,  (UINT)(q - (vbLenPos  + BER_LEN_RESERVE)));
+    ber_put_len(vblLenPos, (UINT)(q - (vblLenPos + BER_LEN_RESERVE)));
+    ber_put_len(pduLenPos, (UINT)(q - (pduLenPos + BER_LEN_RESERVE)));
+    ber_put_len(msgLenPos, (UINT)(q - (msgLenPos + BER_LEN_RESERVE)));
+
+    return (INT)(q - start);
+}
+
+
+/******************************************************************************
+* SNMPv1_BuildErrorResponse_Public
+* Builds a GET-RESPONSE with:
+*   error-status = noSuchName (2)
+*   error-index  = 1
+*******************************************************************************/
+INT SNMPv1_BuildErrorResponse_Public(
+    const UCHAR* inBuf, INT inLen,
+    UCHAR* outBuf, INT outLen)
+{
+    const UCHAR* p        = inBuf;
+    const UCHAR* end      = inBuf + inLen;
+    const UCHAR* msgEnd;
+    const UCHAR* pduEnd;
+    const UCHAR* vblStart;
+    const UCHAR* comm;
+    UINT         msgLen;
+    UINT         pduLen;
+    UINT         vblLen;
+    UINT         commLen;
+    INT          version;
+    INT          reqId;
+    INT          errStat;
+    INT          errIdx;
+    UCHAR*       q;
+    UCHAR*       start;
+    UCHAR*       msgLenPos;
+    UCHAR*       pduLenPos;
+
+    /* Outer SEQUENCE */
+    if (p >= end || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, end, &msgLen);
+    if (!p || p + msgLen > end) return 0;
+    msgEnd = p + msgLen;
+
+    /* Version */
+    p = ber_get_integer(p, msgEnd, &version);
+    if (!p || version != SNMP_VERSION_1) return 0;
+
+    /* Community */
+    p = ber_get_octets(p, msgEnd, &comm, &commLen);
+    if (!p || commLen != SNMP_COMMUNITY_LEN ||
+        memcmp(comm, SNMP_COMMUNITY, SNMP_COMMUNITY_LEN) != 0) return 0;
+
+    /* Expect GET */
+    if (p >= msgEnd || *p++ != PDU_GET) return 0;
+    p = ber_get_len(p, msgEnd, &pduLen);
+    if (!p || p + pduLen > msgEnd) return 0;
+    pduEnd = p + pduLen;
+
+    /* request-id, error-status, error-index */
+    p = ber_get_integer(p, pduEnd, &reqId);
+    p = ber_get_integer(p, pduEnd, &errStat);
+    p = ber_get_integer(p, pduEnd, &errIdx);
+    if (!p) return 0;
+
+    /* Copy VarBindList exactly as received */
+    vblStart = p;
+    vblLen   = (UINT)(pduEnd - p);
+
+    /*******************************
+     * Build error response
+     *******************************/
+    q     = outBuf;
+    start = q;
+
+    *q++ = TAG_SEQUENCE;
+    msgLenPos = q; q += BER_LEN_RESERVE;
+
+    q = ber_put_int(q, SNMP_VERSION_1);
+    q = ber_put_octets(q, (const UCHAR*)SNMP_COMMUNITY, SNMP_COMMUNITY_LEN);
+
+    *q++ = PDU_GETRESP;
+    pduLenPos = q; q += BER_LEN_RESERVE;
+
+    q = ber_put_int(q, reqId);
+    q = ber_put_int(q, SNMP_ERR_NOSUCHNAME);
+    q = ber_put_int(q, SNMP_ERR_INDEX_1);
+
+    if (q + vblLen > outBuf + outLen) return 0;
+
+    memcpy(q, vblStart, vblLen);
+    q += vblLen;
+
+    ber_put_len(pduLenPos, (UINT)(q - (pduLenPos + BER_LEN_RESERVE)));
+    ber_put_len(msgLenPos, (UINT)(q - (msgLenPos + BER_LEN_RESERVE)));
+
+    return (INT)(q - start);
+}
+
+
+/******************************************************************************
+* SNMPv1_ExtractRequestedOid
+*
+* Parses the incoming SNMPv1 GET packet and extracts the requested OID
+* as a dotted-decimal string into oidBuf.
+*
+* Validates: outer SEQUENCE, version=0, community="public", PDU=GET.
+* Then reads the first VarBind and decodes the OID bytes.
+*
+* Returns TRUE on success, FALSE on parse error or buffer overflow.
+*******************************************************************************/
+BOOL SNMPv1_ExtractRequestedOid(
+    const UCHAR* inBuf,
+    INT          inLen,
+    CHAR*        oidBuf,
+    INT          oidBufSz)
+{
+    const UCHAR* p      = inBuf;
+    const UCHAR* end    = inBuf + inLen;
+    const UCHAR* msgEnd;
+    const UCHAR* pduEnd;
+    const UCHAR* vblEnd;
+    const UCHAR* vbEnd;
+    const UCHAR* comm;
+    const UCHAR* oidPtr;
+    UINT         msgLen;
+    UINT         pduLen;
+    UINT         vblLen;
+    UINT         vbLen;
+    UINT         commLen;
+    UINT         oidLen;
+    INT          version;
+    INT          reqId;
+    INT          errStat;
+    INT          errIdx;
+
+    if (!inBuf || inLen <= 0 || !oidBuf || oidBufSz <= 0)
+        return FALSE;
+
+    /* Outer SEQUENCE */
+    if (p >= end || *p++ != TAG_SEQUENCE) return FALSE;
+    p = ber_get_len(p, end, &msgLen);
+    if (!p || p + msgLen > end) return FALSE;
+    msgEnd = p + msgLen;
+
+    /* Version = SNMPv1 */
+    p = ber_get_integer(p, msgEnd, &version);
+    if (!p || version != SNMP_VERSION_1) return FALSE;
+
+    /* Community ("public") */
+    p = ber_get_octets(p, msgEnd, &comm, &commLen);
+    if (!p || commLen != SNMP_COMMUNITY_LEN ||
+        memcmp(comm, SNMP_COMMUNITY, SNMP_COMMUNITY_LEN) != 0) return FALSE;
+
+    /* PDU type GET */
+    if (p >= msgEnd || *p++ != PDU_GET) return FALSE;
+    p = ber_get_len(p, msgEnd, &pduLen);
+    if (!p || p + pduLen > msgEnd) return FALSE;
+    pduEnd = p + pduLen;
+
+    /* request-id, error-status, error-index */
+    p = ber_get_integer(p, pduEnd, &reqId);
+    p = ber_get_integer(p, pduEnd, &errStat);
+    p = ber_get_integer(p, pduEnd, &errIdx);
+    if (!p) return FALSE;
+
+    /* VarBindList SEQUENCE */
+    if (p >= pduEnd || *p++ != TAG_SEQUENCE) return FALSE;
+    p = ber_get_len(p, pduEnd, &vblLen);
+    if (!p || p + vblLen > pduEnd) return FALSE;
+    vblEnd = p + vblLen;
+
+    /* VarBind SEQUENCE */
+    if (p >= vblEnd || *p++ != TAG_SEQUENCE) return FALSE;
+    p = ber_get_len(p, vblEnd, &vbLen);
+    if (!p || p + vbLen > vblEnd) return FALSE;
+    vbEnd = p + vbLen;
+
+    /* Extract OID raw bytes */
+    p = ber_get_oid_val_ptr(p, vbEnd, &oidPtr, &oidLen);
+    if (!p) return FALSE;
+
+    /* Decode BER OID bytes into dotted-decimal string */
+    return ber_decode_oid_to_string(oidPtr, oidLen, oidBuf, oidBufSz);
+}
+
+
+/******************************************************************************
+* SNMPv1_BuildGetResponse_Public_TimeTicks
+*
+* Same as BuildGetResponse_Public_String but writes a TimeTicks value
+* (BER tag 0x43) instead of an OCTET STRING.
+*
+* TimeTicks is an unsigned 32-bit integer representing hundredths of a second
+* since the SNMP agent started. SNMP tools display it as "days, HH:MM:SS.ss".
+*******************************************************************************/
+INT SNMPv1_BuildGetResponse_Public_TimeTicks(
+    const UCHAR* inBuf, INT inLen,
+    const CHAR* pszExpectedOid, ULONG ulTimeTicks,
+    UCHAR* outBuf, INT outBufLen)
+{
+    const UCHAR* p      = inBuf;
+    const UCHAR* end    = inBuf + inLen;
+    const UCHAR* msgEnd;
+    const UCHAR* pduEnd;
+    const UCHAR* vblEnd;
+    const UCHAR* vbEnd;
+    const UCHAR* comm;
+    const UCHAR* oidPtr;
+    UINT         msgLen;
+    UINT         pduLen;
+    UINT         vblLen;
+    UINT         vbLen;
+    UINT         commLen;
+    UINT         oidLen;
+    UINT         nullLen;
+    INT          version;
+    INT          reqId;
+    INT          errStat;
+    INT          errIdx;
+    UCHAR*       q;
+    UCHAR*       start;
+    UCHAR*       msgLenPos;
+    UCHAR*       pduLenPos;
+    UCHAR*       vblLenPos;
+    UCHAR*       vbLenPos;
+
+    /* Expect outer SEQUENCE */
+    if (p >= end || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, end, &msgLen);
+    if (!p || p + msgLen > end) return 0;
+    msgEnd = p + msgLen;
+
+    /* Version = SNMPv1 */
+    p = ber_get_integer(p, msgEnd, &version);
+    if (!p || version != SNMP_VERSION_1) return 0;
+
+    /* Community ("public") */
+    p = ber_get_octets(p, msgEnd, &comm, &commLen);
+    if (!p || commLen != SNMP_COMMUNITY_LEN ||
+        memcmp(comm, SNMP_COMMUNITY, SNMP_COMMUNITY_LEN) != 0) return 0;
+
+    /* PDU type GET */
+    if (p >= msgEnd || *p++ != PDU_GET) return 0;
+    p = ber_get_len(p, msgEnd, &pduLen);
+    if (!p || p + pduLen > msgEnd) return 0;
+    pduEnd = p + pduLen;
+
+    /* request-id, error-status, error-index */
+    p = ber_get_integer(p, pduEnd, &reqId);
+    p = ber_get_integer(p, pduEnd, &errStat);
+    p = ber_get_integer(p, pduEnd, &errIdx);
+    if (!p) return 0;
+
+    /* VarBindList SEQUENCE */
+    if (p >= pduEnd || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, pduEnd, &vblLen);
+    if (!p || p + vblLen > pduEnd) return 0;
+    vblEnd = p + vblLen;
+
+    /* VarBind SEQUENCE */
+    if (p >= vblEnd || *p++ != TAG_SEQUENCE) return 0;
+    p = ber_get_len(p, vblEnd, &vbLen);
+    if (!p || p + vbLen > vblEnd) return 0;
+    vbEnd = p + vbLen;
+
+    /* Extract OID */
+    p = ber_get_oid_val_ptr(p, vbEnd, &oidPtr, &oidLen);
+    if (!p) return 0;
+
+    /* GET request always carries NULL as the value */
+    if (p >= vbEnd || *p++ != TAG_NULL) return 0;
+    p = ber_get_len(p, vbEnd, &nullLen);
+    if (!p || nullLen != 0) return 0;
+
+    /* Check OID match */
+    if (!ber_oid_equals(oidPtr, oidLen, pszExpectedOid)) return 0;
+
+    /*******************************
+     * Build the GET-RESPONSE PDU
+     *******************************/
+    q     = outBuf;
+    start = q;
+
+    *q++ = TAG_SEQUENCE;
+    msgLenPos = q; q += BER_LEN_RESERVE;
+
+    q = ber_put_int(q, SNMP_VERSION_1);
+    q = ber_put_octets(q, (const UCHAR*)SNMP_COMMUNITY, SNMP_COMMUNITY_LEN);
+
+    *q++ = PDU_GETRESP;
+    pduLenPos = q; q += BER_LEN_RESERVE;
+
+    q = ber_put_int(q, reqId);
+    q = ber_put_int(q, 0);
+    q = ber_put_int(q, 0);
+
+    *q++ = TAG_SEQUENCE;
+    vblLenPos = q; q += BER_LEN_RESERVE;
+
+    *q++ = TAG_SEQUENCE;
+    vbLenPos = q; q += BER_LEN_RESERVE;
+
+    /* Write encoded OID */
+    {
+        UCHAR  tmp[OID_ENCODE_BUF];
+        UCHAR* t   = ber_put_oid(tmp, pszExpectedOid);
+        UINT   len = (UINT)(t - tmp);
+        memcpy(q, tmp, len);
+        q += len;
+    }
+
+    /* Write TimeTicks value (tag 0x43) */
+    q = ber_put_timeticks(q, ulTimeTicks);
+
+    /* Patch all reserved lengths */
+    ber_put_len(vbLenPos,  (UINT)(q - (vbLenPos  + BER_LEN_RESERVE)));
+    ber_put_len(vblLenPos, (UINT)(q - (vblLenPos + BER_LEN_RESERVE)));
+    ber_put_len(pduLenPos, (UINT)(q - (pduLenPos + BER_LEN_RESERVE)));
+    ber_put_len(msgLenPos, (UINT)(q - (msgLenPos + BER_LEN_RESERVE)));
+
+    return (INT)(q - start);
+}
+
+
+
+
+
+
+
+
+
